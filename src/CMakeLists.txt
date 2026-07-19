@@ -51,6 +51,14 @@ endif()
 
 if(BUILD_WITH_TM2)
     include(${_rel_path}/tm2/CMakeLists.txt)
+    # Host-side stereo depth from the T265 fisheye pair. Lives in proc/ alongside the other
+    # processing blocks (zero-order set the precedent for device-specific ones).
+    target_sources(${LRS_TARGET} PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/proc/t265-stereo-rectify.h"
+        "${CMAKE_CURRENT_LIST_DIR}/proc/t265-stereo-rectify.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/proc/t265-stereo-match.h"
+        "${CMAKE_CURRENT_LIST_DIR}/proc/t265-stereo-match.cpp"
+    )
 endif()
 
 if(BUILD_WITH_L500)
