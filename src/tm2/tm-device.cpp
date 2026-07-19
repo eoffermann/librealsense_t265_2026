@@ -589,6 +589,39 @@ namespace librealsense
         results.push_back(profile);
         profile_map[SET_SENSOR_ID(SensorType::Pose, 0)] = profile;
 
+        // Add a synthesised depth stream, computed on the host from the fisheye pair.
+        // Like pose this is not a raw stream the device can be asked for. It is only
+        // offered when the device actually has two fisheye cameras to work with.
+        {
+            int fisheye_count = 0;
+            for( auto const & raw : _supported_raw_streams )
+                if( GET_SENSOR_TYPE( raw.bSensorID ) == SensorType::Fisheye )
+                    ++fisheye_count;
+
+            if( fisheye_count >= 2 )
+            {
+                auto depth = std::make_shared< video_stream_profile >();
+                depth->set_stream_type( RS2_STREAM_DEPTH );
+                depth->set_stream_index( 0 );
+                depth->set_format( RS2_FORMAT_Z16 );
+                depth->set_framerate( 30 );
+                depth->set_dims( _stereo_cfg.width_px() - _stereo_cfg.max_disparity,
+                                 _stereo_cfg.height_px );
+                depth->set_unique_id( environment::get_instance().generate_stream_id() );
+
+                // Rectified output is an ideal pinhole; the principal point shifts because
+                // the disparity search margin is cropped before publishing.
+                auto intr = t265_stereo::rectified_intrinsics( _stereo_cfg );
+                intr.width -= _stereo_cfg.max_disparity;
+                intr.ppx   -= _stereo_cfg.max_disparity;
+                depth->set_intrinsics( [intr]() { return intr; } );
+
+                depth->tag_profile( profile_tag::PROFILE_TAG_SUPERSET );
+                results.push_back( depth );
+                _depth_profile = depth;
+            }
+        }
+
         //add extrinsic parameters
         for (auto profile : results)
         {
@@ -649,6 +682,16 @@ namespace librealsense
                 continue;
             }
 
+            if(stream_type == RS2_STREAM_DEPTH) {
+                // Depth is derived from the fisheye pair, so both fisheye raw streams have
+                // to be switched on whether or not the caller asked for them. They are
+                // enabled below, after the requested streams have been processed, so an
+                // explicit fisheye request still takes precedence for format and rate.
+                LOG_DEBUG("Host-side stereo depth enabled");
+                _depth_output_enabled = true;
+                continue;
+            }
+
             bool found = false;
             for(auto & tm_profile : _active_raw_streams) {
                 if(GET_SENSOR_TYPE(tm_profile.bSensorID) == tm_sensor_type &&
@@ -669,6 +712,15 @@ namespace librealsense
             }
             if(!found)
                 throw invalid_value_exception("Invalid profile configuration - no matching stream");
+        }
+
+        if( _depth_output_enabled )
+        {
+            // Enable both fisheye streams at their native configuration if the caller did
+            // not request them itself.
+            for( auto & tm_profile : _active_raw_streams )
+                if( GET_SENSOR_TYPE( tm_profile.bSensorID ) == SensorType::Fisheye )
+                    tm_profile.bOutputMode = 1;
         }
 
         int fisheye_streams = 0;
@@ -743,6 +795,7 @@ namespace librealsense
         //reset active profiles
         _active_raw_streams.clear();
         _pose_output_enabled = false;
+        _depth_output_enabled = false;
 
         _is_opened = false;
         set_active_streams({});
@@ -859,6 +912,9 @@ namespace librealsense
         _source.set_callback(callback);
         raise_on_before_streaming_changes(true);
 
+        if( _depth_output_enabled )
+            start_stereo_worker();
+
         bulk_message_request_start request = {{ sizeof(request), DEV_START }};
         bulk_message_response_start response = {};
         _device->bulk_request_response(request, response, sizeof(response), false);
@@ -885,6 +941,9 @@ namespace librealsense
 
     void tm2_sensor::stop()
     {
+        // Outside the op lock: the worker takes _stereo_mutex and must be able to finish.
+        stop_stereo_worker();
+
         std::lock_guard<std::mutex> lock(_tm_op_lock);
         LOG_DEBUG("Stopping T265");
         if (!_is_streaming)
@@ -1254,6 +1313,16 @@ namespace librealsense
             LOG_WARNING("Dropped frame. No valid profile");
             return;
         }
+
+        // Feed the stereo depth worker. Dimensions come from the profile rather than the
+        // message, which carries only the payload length. Sensor index is 0/1 on the wire;
+        // librealsense presents the same cameras as fisheye 1 and 2.
+        if( _depth_output_enabled )
+            submit_fisheye_for_depth( GET_SENSOR_INDEX( message->rawStreamHeader.bSensorID ),
+                                      message->metadata.bFrameData,
+                                      width, height,
+                                      ts.global_ts.count(),
+                                      message->rawStreamHeader.dwFrameId );
 
         //Global base time sync may happen between two frames
         //Make sure 2nd frame global timestamp is not impacted.
@@ -2233,6 +2302,207 @@ namespace librealsense
             }
 
         _extrinsics[stream.get_unique_id()] = std::make_pair(group_index, tm2_profiles[ref_index]);
+    }
+
+
+    // ==========================================================================================
+    // Host-side stereo depth
+    //
+    // The device cannot produce depth, so it is computed here from the rectified fisheye pair.
+    // Matching takes a few hundred milliseconds, so it runs on a worker thread that always
+    // takes the newest complete pair and discards anything that arrived while it was busy.
+    // Depth therefore runs at a lower and more variable rate than the fisheye streams, which is
+    // the intended trade: dropping frames is far better than stalling the USB message loop.
+
+    void tm2_sensor::build_stereo_maps()
+    {
+        if( _stereo_maps_ready )
+            return;
+
+        std::shared_ptr< stream_profile_interface > left, right;
+        for( auto const & p : initialized_profiles() )
+        {
+            if( p->get_stream_type() != RS2_STREAM_FISHEYE )
+                continue;
+            if( p->get_stream_index() == 1 ) left = p;
+            if( p->get_stream_index() == 2 ) right = p;
+        }
+        if( ! left || ! right )
+        {
+            LOG_ERROR( "Cannot build stereo maps: fisheye profiles not found" );
+            return;
+        }
+
+        auto Kl = get_intrinsics( to_profile( left.get() ) );
+        auto Kr = get_intrinsics( to_profile( right.get() ) );
+
+        // Extrinsics here are held relative to the pose stream, so compose left->pose->right:
+        // R = Rr^T * Rl and t = Rr^T * (tl - tr). rs2_extrinsics stores column-major.
+        auto El = get_extrinsics( *left, 0 );
+        auto Er = get_extrinsics( *right, 0 );
+
+        float R_col[9], t[3];
+        for( int r = 0; r < 3; ++r )
+            for( int c = 0; c < 3; ++c )
+            {
+                float sum = 0.f;
+                for( int k = 0; k < 3; ++k )
+                    sum += Er.rotation[r * 3 + k] * El.rotation[c * 3 + k];
+                R_col[c * 3 + r] = sum;
+            }
+        for( int r = 0; r < 3; ++r )
+        {
+            float sum = 0.f;
+            for( int k = 0; k < 3; ++k )
+                sum += Er.rotation[r * 3 + k] * ( El.translation[k] - Er.translation[k] );
+            t[r] = sum;
+        }
+
+        _stereo_baseline = std::sqrt( t[0] * t[0] + t[1] * t[1] + t[2] * t[2] );
+
+        // build_remap wants row-major.
+        float R_row[9];
+        for( int r = 0; r < 3; ++r )
+            for( int c = 0; c < 3; ++c )
+                R_row[r * 3 + c] = R_col[c * 3 + r];
+
+        float const identity[9] = { 1,0,0, 0,1,0, 0,0,1 };
+        _remap_left  = t265_stereo::build_remap( Kl, identity, _stereo_cfg );
+        _remap_right = t265_stereo::build_remap( Kr, R_row,    _stereo_cfg );
+
+        _matcher_cfg.max_disparity = _stereo_cfg.max_disparity;
+
+        int const W = _stereo_cfg.width_px(), H = _stereo_cfg.height_px;
+        _pending_left.assign( size_t( W ) * H, 0 );
+        _pending_right.assign( size_t( W ) * H, 0 );
+        _have_left = _have_right = false;
+
+        _stereo_maps_ready = true;
+        LOG_INFO( "T265 stereo depth ready: baseline " << _stereo_baseline << "m, output "
+                  << ( W - _stereo_cfg.max_disparity ) << "x" << H );
+    }
+
+    void tm2_sensor::start_stereo_worker()
+    {
+        build_stereo_maps();
+        if( ! _stereo_maps_ready )
+            return;
+
+        _stereo_stop = false;
+        _stereo_thread = std::thread( [this]() { stereo_worker(); } );
+    }
+
+    void tm2_sensor::stop_stereo_worker()
+    {
+        if( ! _stereo_thread.joinable() )
+            return;
+
+        {
+            std::lock_guard< std::mutex > lk( _stereo_mutex );
+            _stereo_stop = true;
+        }
+        _stereo_cv.notify_all();
+        _stereo_thread.join();
+
+        std::lock_guard< std::mutex > lk( _stereo_mutex );
+        _have_left = _have_right = false;
+    }
+
+    void tm2_sensor::submit_fisheye_for_depth( int sensor_id, uint8_t const * data,
+                                               int width, int height, double timestamp,
+                                               unsigned long long frame_number )
+    {
+        if( ! _stereo_maps_ready || ! data )
+            return;
+
+        auto const & table = ( sensor_id == 0 ) ? _remap_left : _remap_right;
+
+        std::lock_guard< std::mutex > lk( _stereo_mutex );
+        auto & dst = ( sensor_id == 0 ) ? _pending_left : _pending_right;
+
+        // Rectify here rather than in the worker: it costs about 2ms and means only the
+        // small rectified image is retained rather than a copy of the full 848x800 source.
+        t265_stereo::remap_y8( data, width, height, table, dst.data() );
+
+        if( sensor_id == 0 ) _have_left = true;
+        else                 _have_right = true;
+
+        if( _have_left && _have_right )
+        {
+            _pending_timestamp = timestamp;
+            _pending_frame_number = frame_number;
+            _stereo_cv.notify_one();
+        }
+    }
+
+    void tm2_sensor::stereo_worker()
+    {
+        int const W = _stereo_cfg.width_px(), H = _stereo_cfg.height_px;
+        int const roi_w = W - _stereo_cfg.max_disparity;
+        float const focal = _stereo_cfg.focal_px();
+        float const depth_units = 0.001f;
+
+        std::vector< uint8_t >  left( size_t( W ) * H ), right( size_t( W ) * H );
+        std::vector< float >    disparity( size_t( W ) * H );
+        std::vector< uint16_t > depth( size_t( W ) * H );
+
+        while( true )
+        {
+            double ts = 0.0;
+            unsigned long long fn = 0;
+            {
+                std::unique_lock< std::mutex > lk( _stereo_mutex );
+                _stereo_cv.wait( lk, [this]() { return _stereo_stop || ( _have_left && _have_right ); } );
+                if( _stereo_stop )
+                    return;
+
+                // Take the pair and clear the slots, so frames arriving while we compute
+                // replace each other rather than queueing up.
+                left  = _pending_left;
+                right = _pending_right;
+                ts = _pending_timestamp;
+                fn = _pending_frame_number;
+                _have_left = _have_right = false;
+            }
+
+            t265_stereo::match_disparity( left.data(), right.data(), W, H, _matcher_cfg,
+                                          disparity.data() );
+            t265_stereo::disparity_to_depth_z16( disparity.data(), W, H, focal, _stereo_baseline,
+                                                 depth_units, 0.15f, 8.f, depth.data() );
+
+            if( _stereo_stop || ! _is_streaming || ! _depth_profile )
+                continue;
+
+            frame_additional_data additional_data( ts, fn, ts, 0, nullptr, ts, 0, 0, false, 0.0 );
+
+            frame_holder frame = _source.alloc_frame(
+                { RS2_STREAM_DEPTH, 0, RS2_EXTENSION_DEPTH_FRAME },
+                size_t( roi_w ) * H * sizeof( uint16_t ),
+                std::move( additional_data ),
+                true );
+
+            if( ! frame.frame )
+            {
+                LOG_DEBUG( "Dropped depth frame: no buffer available" );
+                continue;
+            }
+
+            auto video = static_cast< video_frame * >( frame.frame );
+            video->assign( roi_w, H, roi_w * int( sizeof( uint16_t ) ), 16 );
+            frame->set_timestamp( ts );
+            frame->set_timestamp_domain( RS2_TIMESTAMP_DOMAIN_HARDWARE_CLOCK );
+            frame->set_stream( _depth_profile );
+
+            // Copy out the region of interest, dropping the disparity search margin.
+            auto * out = reinterpret_cast< uint16_t * >(
+                const_cast< uint8_t * >( video->get_frame_data() ) );
+            for( int y = 0; y < H; ++y )
+                std::memcpy( out + size_t( y ) * roi_w,
+                             depth.data() + size_t( y ) * W + _stereo_cfg.max_disparity,
+                             size_t( roi_w ) * sizeof( uint16_t ) );
+
+            _source.invoke_callback( std::move( frame ) );
+        }
     }
 
 }
