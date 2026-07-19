@@ -856,3 +856,39 @@ firmware-version byte order was checked.
 - No soak testing; all runs are 120 frames
 - `src/ivcam/` still deliberately not restored — the compiler never asked for it across ~20
   build rounds, which settles the earlier disagreement in favour of leaving it out
+
+---
+
+## 13. Backend choice — which build sees which camera
+
+This bit us in practice, so it is worth stating plainly.
+
+**`FORCE_RSUSB_BACKEND=ON` cannot see UVC cameras on Windows.** RSUSB expects a device bound
+to WinUSB via librealsense's INF. A stock D435 or L515 is bound by Windows to the standard
+UVC / Media Foundation driver instead, so an RSUSB build enumerates *nothing* for them — with
+no error, it simply finds no devices.
+
+| Camera | Transport | RSUSB backend | Media Foundation backend |
+|---|---|---|---|
+| **T265** | raw USB (WinUSB) | ✅ | ✅ |
+| **L515** | UVC | ❌ invisible | ✅ |
+| **D435 / D400** | UVC | ❌ invisible | ✅ |
+
+T265 was developed against `FORCE_RSUSB_BACKEND=ON` purely because ATL was missing and the MF
+backend would not compile (§4a). That is no longer true — **use the Media Foundation backend
+(the default) for everything.**
+
+### The build to use
+
+```
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 \
+      -DBUILD_WITH_TM2=ON -DBUILD_WITH_L500=ON \
+      -DBUILD_EXAMPLES=ON -DBUILD_GRAPHICAL_EXAMPLES=ON -DBUILD_TOOLS=ON
+```
+
+No `FORCE_RSUSB_BACKEND`. This configuration is verified to build clean and to enumerate D435
+(`5.11.15`, product line D400), L515 and T265. T265 still works here because it goes through
+the raw-USB layer regardless of which UVC backend is selected — the two are independent.
+
+**Symptom to recognise:** if a camera that should be supported enumerates as nothing at all,
+check `FORCE_RSUSB_BACKEND` in that build's `CMakeCache.txt` before suspecting the driver.
