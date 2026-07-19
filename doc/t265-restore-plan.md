@@ -91,16 +91,21 @@ actively maintained; only the *device/sensor* layer was removed.
 The `pose-frame.h` copyright year (2024) is significant: pose frame handling was maintained
 *after* the T265 removal, so this is not bit-rotted code.
 
-**Firmware availability — verified 2026-07-18:**
+**Firmware availability — downloaded and verified 2026-07-18:**
 
 ```
 https://librealsense.intel.com/Releases/TM2/FW/target/0.2.0.951/target-0.2.0.951.mvcmd
-  -> HTTP 200, 9,323,648 bytes
-  SHA1: c3940ccbb0e3045603e4aceaa2d73427f96e24bc
+  -> HTTP 200, 9,323,648 bytes   (matches expected size)
+  -> SHA1 c3940ccbb0e3045603e4aceaa2d73427f96e24bc   (matches the value the 2023
+     build system checked against — the blob is bit-identical, not merely present)
 ```
 
-This was the single largest feasibility risk (T265 is EOL). It is currently fine, but the
-blob **should be mirrored locally now** — do not depend on Intel keeping it up.
+This was the single largest feasibility risk (T265 is EOL). The full blob was fetched and
+hash-verified, not just probed — so the firmware Intel serves today is confirmed good.
+
+**Still outstanding:** the blob needs a permanent mirror. It currently exists only in a
+session-scoped scratch directory, which will be lost. Do not treat this risk as closed until
+it is stored somewhere durable and referenced from the build.
 
 ## 4. What actually changed underneath
 
@@ -122,6 +127,46 @@ The USB abstraction layer (`src/usb/`) is unchanged in the ways that matter:
 `tm-boot.h` should port with little or no change.
 
 ---
+
+## 4a. Development environment — **BLOCKER, must be resolved before Phase 1**
+
+Target dev/test machine is the Windows 11 laptop the T265 will be attached to. Audited
+2026-07-18: **no C++ build toolchain is installed.**
+
+| Requirement | State | Needed |
+|---|---|---|
+| CMake ≥ 3.10 | **ABSENT** (not on PATH, not in any standard install dir) | 3.16.3+ recommended |
+| Visual Studio / MSVC | **ABSENT** (no install dir, no `vswhere`, no `cl`, no `msbuild`) | VS 2019/2022, "Desktop development with C++" workload — or standalone Build Tools |
+| Ninja / gcc (alternatives) | **ABSENT** | — |
+| Python 3 | **STUB ONLY** — resolves to the Microsoft Store `WindowsApps` alias, not a real interpreter | Real CPython 3.x, needed for unit tests and `pyrealsense2` |
+| Git | Present (2.55.0) | — |
+
+Nothing can be compiled, and therefore nothing can be tested against hardware, until this is
+installed. This is the single gating prerequisite for the whole plan.
+
+**Recommended sequence once installed:**
+
+1. Build **unmodified** `development` first, before any T265 code is added. This establishes
+   a known-good baseline. Without it, a build failure after Phase 1 is ambiguous — a
+   pre-existing environment problem is indistinguishable from a porting mistake.
+2. Only then begin Phase 1.
+
+**Windows-specific notes for T265:**
+
+- T265 is a **raw USB device, not UVC**, so it goes through the WinUSB backend
+  (`src/winusb/` — present and intact on `development`) rather than the Media Foundation path.
+- Windows must bind **WinUSB** to the device. The T265 binding survives in
+  `src/win7/drivers/IntelRealSense_D400_series_win7.inf:65` (`USB\VID_8087&PID_0B37`).
+  Whether Windows 11 binds this automatically via MS OS descriptors or needs a manual driver
+  install is **unverified** — expect to spend time here.
+- Booting is two-stage: the unbooted device appears as Movidius `03E7:2150`, receives the
+  firmware over a bulk transfer, then re-enumerates as `8087:0B37`. Both USB IDs are already
+  present in `config/99-realsense-libusb.rules:55-56` (relevant to Linux; on Windows the
+  driver binding is the equivalent concern).
+
+**Hardware status at time of writing:** T265 not yet attached — a USB scan found no
+`03E7:2150` or `8087:0B37` device. (Note that `VID_8087` alone is a false positive: Intel
+wireless Bluetooth shares that vendor ID.)
 
 ## 5. Phases
 
@@ -323,6 +368,21 @@ Do not mark a phase complete on the strength of a clean build alone.
 
 ## 8. Open questions
 
-- Which platforms must be supported? (Linux-only would cut significant work)
-- Are ros2 bags required, or is the legacy rosbag path sufficient?
-- Is the T265 firmware blob mirrored internally yet?
+**Answered 2026-07-18:**
+
+- ~~Is physical T265 hardware available for verification?~~ **Yes** — hardware is on hand and
+  will be attached to the Windows 11 dev laptop. The full verification ladder is reachable.
+- ~~Which platforms must be supported?~~ **Windows 11** is the dev/test target. Note this is
+  the *harder* platform for T265: the WinUSB driver-binding question (§4a) does not arise on
+  Linux, where udev rules already cover both USB IDs.
+
+**Still open:**
+
+- Where should the firmware blob be permanently mirrored? It must not go in git (9.3 MB
+  binary), so it needs an internal artifact store or a documented fetch-and-verify step.
+- Are ros2 bags required, or is the legacy rosbag path sufficient? (Determines whether the
+  Phase 6 `ros2_writer.cpp` fix is in scope.)
+- Where does this work get pushed? No `fork` remote is configured and `origin` is upstream
+  (§Phase 0). Nothing can be pushed until this is decided.
+- Is Linux support also wanted eventually? If so, much of the driver work is shared, but the
+  platform-specific USB layer would need separate validation.
