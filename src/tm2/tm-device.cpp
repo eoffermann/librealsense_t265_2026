@@ -1375,9 +1375,11 @@ namespace librealsense
     {
         if (_interrupt_request) {
             _interrupt_callback->cancel();
-            if (_device->cancel_request(_interrupt_request)) {
-                _interrupt_request.reset();
-            }
+            if (!_device->cancel_request(_interrupt_request))
+                LOG_WARNING("Failed to cancel the T265 interrupt request; releasing it anyway");
+
+            // Same reasoning as stop_stream(): see the note there.
+            _interrupt_request.reset();
         }
     }
 
@@ -1436,9 +1438,16 @@ namespace librealsense
     {
         if (_stream_request) {
             _stream_callback->cancel();
-            if (_device->cancel_request(_stream_request)) {
-                _stream_request.reset();
-            }
+            if (!_device->cancel_request(_stream_request))
+                LOG_WARNING("Failed to cancel the T265 stream request; releasing it anyway");
+
+            // Released unconditionally, and deliberately so. This used to reset only when
+            // cancel succeeded, which meant a single failed cancel left _stream_request set
+            // forever -- and start_stream() early-returns when it is set, so the sensor
+            // silently never streamed again for the life of the process. Dropping our handle
+            // is safe: the request is shared_ptr-owned, the callback has already been
+            // cancelled, and at worst one request lingers until the USB layer releases it.
+            _stream_request.reset();
         }
     }
 
