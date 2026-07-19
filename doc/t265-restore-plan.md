@@ -898,3 +898,22 @@ No `FORCE_RSUSB_BACKEND`. Verified to enumerate D435, L515 and T265 together.
 
 **Symptom to recognise:** if a camera that should be supported enumerates as nothing at all,
 check `FORCE_RSUSB_BACKEND` in that build's `CMakeCache.txt` before suspecting the driver.
+
+---
+
+## 14. Viewer: multiple cameras need "Add Source"
+
+Not a bug, and not ours — worth writing down because it reads like one.
+
+With two cameras attached, `realsense-viewer` fires a connection toast for both but only shows
+the **first** in the sources panel. That is upstream behaviour: `refresh_devices()` in
+`tools/realsense-viewer/realsense-viewer.cpp:200` only auto-creates a `device_model` when
+`device_models.size() == 0`.
+
+Every detected device *is* registered, and the toolbar shows **"Add Source (N)"** with the
+count of detected-but-unopened devices (`realsense-viewer.cpp:424`). Click it and pick the
+second camera.
+
+Verified: T265 and L515 run simultaneously in the viewer this way, with all streams available
+on both. `rs-enumerate-devices` lists both regardless, which is the quick way to tell a
+viewer-UI question from a driver one.
