@@ -1,3 +1,26 @@
+> [!IMPORTANT]
+> ## T265-preserving fork of librealsense
+>
+> This is a fork of [realsenseai/librealsense](https://github.com/realsenseai/librealsense) with a single purpose: **keep Intel RealSense T265 (TM2) tracking camera support alive, while staying current with upstream librealsense.**
+>
+> Upstream removed T265/TM2 support in January 2023 ([PR #11287](https://github.com/realsenseai/librealsense/pull/11287)), shortly after release `v2.53.1`. The usual way to keep using a T265 is to pin to that last release and forgo three and a half years of SDK improvements. This fork takes the other approach: restore the T265 driver and **forward-port it onto current upstream code**, then keep merging upstream as it evolves.
+>
+> ### Status: restoration in progress — T265 does not work in this fork yet
+>
+> Be clear-eyed about what this repository currently contains. The T265 driver has **not** yet been restored. What exists today is a detailed, evidence-backed restoration plan in [`doc/t265-restore-plan.md`](doc/t265-restore-plan.md), derived from analysing the removal commits against current upstream.
+>
+> Established so far:
+>
+> - The T265 firmware blob is still downloadable from Intel and hash-verifies as bit-identical to what the 2023 build expected
+> - Most of the pose/tracking API (`RS2_STREAM_POSE`, `rs2_pose`, `pose_frame`, rosbag record/playback, Python bindings) was never removed and is still functional — only the device driver layer was deleted
+> - Reverting the removal onto current upstream produces only 10 conflicting files, with all 8 `src/tm2/*` sources restoring cleanly
+> - The port is sized at roughly 2.5–3 weeks of work, with about 67% of the driver expected to compile unchanged
+>
+> **If you need a working T265 today, use [`v2.53.1`](https://github.com/realsenseai/librealsense/releases/tag/v2.53.1) from upstream, not this fork.**
+> **If you use any other RealSense camera, use [upstream](https://github.com/realsenseai/librealsense) — this fork offers you nothing extra.**
+>
+> Everything below this banner is upstream's documentation and applies unchanged.
+
 <p align="center">
 <!-- Light mode -->
 <img src="doc/img/realsense-logo-light-mode.png#gh-light-mode-only" alt="Logo for light mode" width="30%"/>
