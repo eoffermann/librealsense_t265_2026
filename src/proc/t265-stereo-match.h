@@ -30,6 +30,15 @@ struct matcher_config
     bool  lr_check      = true;  // reject matches that disagree left-to-right
     int   lr_max_diff   = 2;     // tolerance for that check, in pixels
     int   min_variance  = 15;    // reject textureless windows outright
+
+    // Semi-global matching. Block matching decides every pixel independently, so it can only
+    // produce depth where there is local texture -- blank surfaces stay empty at any
+    // threshold. SGM instead aggregates cost along paths across the whole image with a
+    // smoothness penalty, which lets depth propagate from textured regions into flat ones.
+    bool  use_sgm       = true;
+    int   sgm_paths     = 8;     // 4 (axis-aligned) or 8 (adds diagonals)
+    int   p1            = 7;     // penalty for a one-step disparity change along a path
+    int   p2            = 86;    // penalty for a larger jump; scaled down at intensity edges
 };
 
 // Defaults above were chosen by sweeping one captured frame pair. Measured coverage:
