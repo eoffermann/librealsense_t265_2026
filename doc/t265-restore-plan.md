@@ -222,19 +222,46 @@ is what makes Phase 9 cheap.
 be accepted upstream — it was removed deliberately — so this work must never be pushed to
 `origin`. Configure a `fork` remote before any push.
 
-### Phase 1 — Mechanical restore
+### Phase 1 — Mechanical restore — ✅ **DONE 2026-07-18**
 
-Revert the four removal commits onto the branch:
+All 4,201 lines of `src/tm2/*` restored byte-identical from `391d5356e`, **deliberately not
+wired into the build**. `realsense2` still builds clean (exit 0) and no `tm2` translation
+unit is compiled. Baseline intact.
 
-```bash
-git revert --no-commit -m 1 1bcaa97fe
-git revert --no-commit fe5aff43f b6ee94d4d 1cde72625
-```
+#### Method changed from the original plan — read this before Phase 2
 
-Resolve the 10 conflicts by keeping `HEAD` and re-adding only T265-specific hunks. Expect
-`src/tm2/*` to land untouched.
+The plan called for reverting the four removal commits and resolving the 10 conflicts. The
+revert was run and then **aborted**, in favour of `git checkout 391d5356e -- src/tm2/`.
 
-**Estimate:** 1–2 days. Cost is well characterized.
+Reason: the 10 conflicts were never the risk. The revert *auto-merged* 23 other files without
+complaint, and three of those changes were wrong:
+
+| File | What the revert would have done | Why it's wrong |
+|---|---|---|
+| `third-party/rsutils/include/rsutils/version.h` | Revert `return( number != 0 )` → `return number` | Unrelated upstream cleanup, undone as collateral. Nothing to do with T265 |
+| `common/rendering.h` | Rename `pose_to_world_transformation` → `tm2_pose_to_world_transformation` | Upstream deliberately generalised this name; the general name is live and in use |
+| `CMake/lrs_options.cmake` | Set `BUILD_WITH_TM2` **ON by default** | Pulls unported `tm-device.cpp` into every build, destroying the baseline |
+
+**Lesson for later phases: conflicts announce themselves, silent auto-merges do not.** Any
+future use of `git revert` against these removal commits must audit the auto-merged set, not
+just the conflicts.
+
+#### Deferred hunks — where the rest of the revert went
+
+Nothing was lost; each piece is deferred to the phase that owns it. Recover any of them with
+`git show 391d5356e:<path>`, or re-run the revert and inspect.
+
+| Deferred to | Files |
+|---|---|
+| **Phase 2** (enumeration) | `src/context.cpp`, `src/context.h` (`unload_tracking_module`) |
+| **Phase 5** (API surface) | `src/core/motion.h` (`tm2_extensions`, `tm2_sensor_interface`), `include/librealsense2/hpp/rs_device.hpp`, `src/rs.cpp`, `wrappers/python/pyrs_device.cpp` |
+| **Phase 7** (viewer/examples) | `common/model-views.cpp`, `common/viewer.cpp`, `common/rendering.h` |
+| **Phase 8** (build/CI) | `CMake/lrs_options.cmake`, `CMake/global_config.cmake` (`add_tm2`), `CMake/unix_config.cmake`, `CMake/android_config.cmake`, `src/CMakeLists.txt`, `.github/workflows/buildsCI.yaml` |
+| **Deliberately dropped** | `common/fw/*` (upstream removed FW bundling — see Phase 4), `unit-tests/unit-tests-live.cpp` (upstream migrated to pytest), `third-party/rsutils/.../version.h` (collateral) |
+
+> Note: not one line of T265 code has been through a compiler yet. Phase 3 will produce a
+> large volume of errors on first build; §3a predicts most of them, and comparing actual
+> against predicted is the fastest check on whether that analysis was sound.
 
 ### Phase 2 — Re-architect device enumeration
 
