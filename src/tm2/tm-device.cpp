@@ -2513,7 +2513,13 @@ namespace librealsense
             if( _stereo_stop || ! _is_streaming || ! _depth_profile )
                 continue;
 
-            frame_additional_data additional_data( ts, fn, ts, 0, nullptr, ts, 0, 0, false, 0.0 );
+            // The depth units belong on the frame, not just on the sensor option. Anything
+            // that turns Z16 into metres -- rs2::pointcloud included -- reads
+            // depth_frame::get_units(), which returns this field verbatim. Leaving it at the
+            // default 0 scales every sample to zero, so the point cloud comes out full of
+            // vertices that are all at the origin.
+            frame_additional_data additional_data( ts, fn, ts, 0, nullptr, ts, 0, 0, false,
+                                                   DEPTH_UNITS );
 
             frame_holder frame = _source.alloc_frame(
                 { RS2_STREAM_DEPTH, 0, RS2_EXTENSION_DEPTH_FRAME },
