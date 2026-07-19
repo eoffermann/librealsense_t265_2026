@@ -1,16 +1,29 @@
-# T265 Restoration Plan
+# Deprecated Camera Restoration Plan
 
-**Status:** ✅ **Phases 1–8 complete.** T265 boots, enumerates and streams pose, both
-fisheye channels, gyro and accel on real hardware. Outstanding: record/playback round-trip
-verification, ros2 bag pose support, and long-duration soak testing.
+*(Originally the T265 plan; §1–§9 are the T265 work, now complete. §10 begins L515 / L500.)*
+
+**Status:** ✅ **T265 COMPLETE AND WORKING.** Phases 1–8 done. The camera boots, enumerates
+and streams pose, both fisheye channels, gyro and accel on real hardware, and both the 2D and
+3D views work in `realsense-viewer` including trajectory rendering.
+Outstanding: record/playback round-trip verification, ros2 bag pose support, and
+long-duration soak testing.
+
+**Next project: L515 / L500 restoration.** L500 was removed upstream on 2023-07-12
+(`dcc73153e`, 6,806 deletions across 57 files) — a larger and more entangled removal than
+T265's. Not yet scoped; see §10.
 **Date:** 2026-07-18
 **Baseline:** `development` @ `21a206d27`
 **Also verified against:** `master` @ `b9d9454b8` (identical results — see §1)
 
 ## Goal
 
-Restore Intel RealSense T265 (TM2) tracking-camera support to this fork, and keep it
-working as upstream librealsense continues to evolve.
+Keep discontinued Intel RealSense cameras working on a current SDK: restore each removed
+driver, forward-port it onto current upstream code, and keep merging upstream as it evolves.
+
+| Camera | Removed upstream | Status |
+|---|---|---|
+| **T265 / TM2** | 2023-01-04, after `v2.53.1` | ✅ Working — §1–§9 |
+| **L515 / L500** | 2023-07-12 | 🚧 Not yet scoped — §10 |
 
 ---
 
@@ -618,3 +631,48 @@ Do not mark a phase complete on the strength of a clean build alone.
   (§Phase 0). Nothing can be pushed until this is decided.
 - Is Linux support also wanted eventually? If so, much of the driver work is shared, but the
   platform-specific USB layer would need separate validation.
+
+---
+
+## 10. Next: L515 / L500 restoration
+
+L500 was removed from upstream on **2023-07-12** (`dcc73153e`, "remove l500 and zero-order
+from src/"): **6,806 deletions across 57 files**. `src/l500/` no longer exists and there is
+no L500 branch in `backend_device_factory`, so an L515 currently enumerates as nothing at
+all — it does not even reach the generic UVC path, which filters *out* Intel VIDs.
+
+**Not yet scoped.** The §3a-style API-delta analysis is what made the T265 port predictable,
+and the same should be done before committing to an estimate.
+
+### Expected to be harder than T265
+
+- **Larger and more spread out** — 6,806 lines over 57 files, vs T265's ~4,600 over 33, most
+  of which was self-contained in `src/tm2/`
+- **Far more entangled.** T265 added a pose stream that the rest of the SDK largely ignored.
+  L500 is a depth camera, so it plugs into the depth/pointcloud/align/processing pipeline
+- **It took `zero-order` with it** — a processing block (`src/proc/zero-order.{h,cpp}`,
+  ~574 lines), not just device code
+
+### Expected to be easier than T265
+
+- **L515 is a UVC device.** It uses the standard `uvc-sensor` path that upstream actively
+  maintains for D400/D500, rather than T265's bespoke USB protocol that no living code
+  exercised
+- No FW-less boot problem: L515 holds its own firmware, so there is no equivalent of the
+  `tm-boot` / firmware-delivery work
+
+### Blocker to resolve first — backend
+
+The working T265 build uses `FORCE_RSUSB_BACKEND=ON`, chosen because the Media Foundation
+backend does not compile without ATL (§4a). That is fine for a raw-USB device like T265 but
+**wrong for a UVC camera on Windows**: RSUSB expects the camera bound to WinUSB via
+librealsense's INF, which a stock L515 will not be.
+
+So before L515 work can be validated on this machine:
+
+1. Reboot (a restart is pending from the Build Tools install)
+2. Install ATL:
+   `winget install --id Microsoft.VisualStudio.2022.BuildTools --force --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Component.VC.ATL"`
+3. Configure a build **without** `FORCE_RSUSB_BACKEND` and confirm the MF backend builds
+
+This also closes the outstanding "cannot claim D400-class cameras are unregressed" gap.
