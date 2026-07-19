@@ -25,12 +25,30 @@ namespace t265_stereo {
 struct matcher_config
 {
     int   max_disparity = 112;   // search range, matched to rectified_config
-    int   window        = 7;     // aggregation window, odd
-    float uniqueness    = 0.85f; // best cost must beat second-best by this ratio
+    int   window        = 11;    // aggregation window, odd
+    float uniqueness    = 0.97f; // best cost must beat second-best by this ratio
     bool  lr_check      = true;  // reject matches that disagree left-to-right
-    int   lr_max_diff   = 1;     // tolerance for that check, in pixels
-    int   min_variance  = 100;   // reject textureless windows outright
+    int   lr_max_diff   = 2;     // tolerance for that check, in pixels
+    int   min_variance  = 15;    // reject textureless windows outright
 };
+
+// Defaults above were chosen by sweeping one captured frame pair. Measured coverage:
+//
+//   strict (window 7, uniq 0.85, var 100, lr 1)   17%   352ms
+//   uniqueness 0.95 alone                         29%   350ms
+//   these defaults                                45%   515ms
+//   these defaults with lr_check off              51%   519ms
+//
+// Uniqueness dominates -- it alone takes 17% to 29%. Disabling the left-right check buys
+// only a further 6%, so it stays on: it is the main defence against false matches in
+// repetitive texture and cheap now that it reuses the main pass.
+//
+// Median depth held at 1.10-1.22m across every configuration against a scene about 1.2m
+// away, which is the reason to trust the looser settings: they admit more real geometry
+// rather than scattering noise at random depths.
+//
+// Passive stereo still cannot invent texture. Blank walls will stay empty whatever these
+// are set to; the honest fix for that is a smarter algorithm, not looser thresholds.
 
 
 // Computes disparity for the left image against the right.

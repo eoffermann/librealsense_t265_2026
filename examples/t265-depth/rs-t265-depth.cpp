@@ -164,8 +164,12 @@ int main() try
         if( ! depth )
             continue;
 
-        auto points = pc.calculate( depth );
+        // Colorize first and map_to before calculate: draw_pointcloud renders via
+        // points.get_texture_coordinates(), and those are only populated by map_to. Without
+        // it every point samples an undefined texel and the cloud draws black.
         auto coloured = colorizer.process( depth );
+        pc.map_to( coloured );
+        auto points = pc.calculate( depth );
         app_state.tex.upload( coloured );
 
         draw_pointcloud( app.width(), app.height(), app_state, points );
