@@ -243,20 +243,120 @@ only other USB-only `device_info` in the tree.
 
 **Estimate:** ~60 lines. Small.
 
-### Phase 3 — Port `tm_device` — **the bulk of the work**
+### Phase 3 — Port `tm_device` — the bulk of the work
 
 Port 2,170 lines of `tm-device.cpp` onto the modern `backend_device` + sensor base classes.
-Note the dual-base virtual-inheritance constructor pattern
-(`src/platform-camera.cpp:104-108`) — both `device` and `backend_device` must be initialized.
-
-`t265-messages.h` (1,532 lines) is pure wire protocol with no SDK dependencies and should
-port as-is.
+`t265-messages.h` (1,532 lines) is pure wire protocol with no SDK dependencies and ports
+verbatim.
 
 **This phase implements `pose_sensor_interface`** — the missing piece that currently makes
 `rs2::pose_sensor` throw for every device.
 
-**This is the main risk and the main unknown.** Timebox a spike here before committing to
-any schedule.
+#### Sizing (static analysis, 2026-07-18 — see §5a for the API delta)
+
+| Bucket | Lines | Share |
+|---|---:|---:|
+| Compiles untouched | ~1,450 | 67% |
+| Mechanical adjustment | ~230 | 11% |
+| Real rework | ~200 | 9% |
+| New code outside the 2,170 | ~250 | — |
+
+**Revised estimate: ~2.5–3 weeks with hardware in hand** (was: "2 weeks or 2 months, unknown").
+Roughly 5–7 days to first clean compile, 3–5 days to first working pose stream, 3–5 days for
+frame-pool and profile-tagging shakeout.
+
+Three things that would have made this a multi-month job did not happen:
+
+1. **`src/usb/*` is byte-for-byte unchanged** (copyright headers aside). Every
+   `bulk_transfer` / `control_transfer` / `create_request` / `submit_request` call compiles
+   verbatim. This was the largest and most fragile block of T265 code.
+2. **`sensor_base` is still a valid direct base for a non-UVC, self-fed sensor.** There is no
+   forced migration to `synthetic_sensor`, which would have been a real redesign. `sensor_base`
+   is what `software_sensor` derives from today, so the pattern is still live.
+3. **`frame_additional_data`'s 10-arg positional constructor survives byte-identical**, and
+   `pose_sensor_interface` / `wheel_odometry_interface` plus their whole `rs.cpp` C-API
+   implementation are intact — so the pose/relocalization/odometry surface needs **zero API
+   design work**.
+
+> These line counts are a projection from static analysis, not a measurement. Treat them as
+> an order-of-magnitude guide — the useful conclusion is "weeks, not months," not the specific
+> percentages.
+
+#### Where the risk actually lives
+
+Not in line count. Two runtime behaviors that a successful compile will **not** catch:
+
+- **Frame archive keying changed.** `frame_source` now keys archives by
+  `(stream, index, extension)` (`src/source.h:20`) rather than by extension alone. T265 pushes
+  two fisheye streams through a single sensor; the old code shared one
+  `RS2_EXTENSION_VIDEO_FRAME` archive across both, the new code will create two. The
+  `set_max_publish_list_size(256)` at `tm-device.cpp:366` was tuned for the shared pool and now
+  means 256 *per archive*. Expect to retune; expect frame-drop symptoms if it is missed.
+- **`format_conversion` / `formats_converter` is new device-level machinery that T265
+  predates** (`src/device.h:34`). T265 emits Y8 and 6DOF natively so conversion should be a
+  no-op, but `device::tag_profiles()` interacts with it and T265 returned an empty tag vector
+  (`tm-device.h:36`). This is a plausible source of "device enumerates but the pipeline won't
+  start."
+
+Both are only diagnosable against real hardware.
+
+### Phase 3a — API delta checklist
+
+Every SDK API `tm-device.cpp`/`.h` depends on that changed between `391d5356e` and
+`origin/development`. Work through this during Phase 3.
+
+**Signature changed — mechanical:**
+
+| API | Old | Today | Sites |
+|---|---|---|---|
+| `sensor_base` ctor | 3 args (name, device*, owner) | 2 args (`src/sensor.h:58`) | 1 |
+| `video_stream_profile` ctor | took `platform::stream_profile` | **arg-less** (`src/stream.h:111`) | 3 (`tm-device.cpp:465,499,542`) |
+| `frame_source::alloc_frame` | `(rs2_extension, size, data, bool)` | `(archive_id, size, data&&, bool)` (`src/source.h:35`) | 3 (`:1118,1230,1534`) — copy `src/software-sensor.cpp:260`; needs `std::move` |
+| `frame_source::set_sensor` | `shared_ptr` | `weak_ptr const&` (`src/source.h:44`) | 1 — implicit conversion, compiles as-is |
+| `playback_device` ctor | `(ctx, reader)` | `(device_info, reader)` (`src/media/playback/playback_device.h:25`) | 1 — build a `playback_device_info` first |
+| `backend_device_group` | uvc/usb | 4 lists incl. mipi | assertion at `:1922` needs a mipi term |
+
+**Renamed / moved:**
+
+| Old | Today |
+|---|---|
+| `frame_callback_ptr` | `rs2_frame_callback_sptr` (`src/core/sensor-interface.h:44`) |
+| `notifications_callback_ptr` | `rs2_notifications_callback_sptr` (`:48`) |
+| `frame_holder` in `archive.h` | `src/core/frame-holder.h:15` |
+| `video_frame` / `pose_frame` / `frame` | `src/core/video-frame.h`, `core/pose-frame.h`, `src/frame.h` |
+| `notification` | `src/core/notification.h:14` (brace-init still binds) |
+| `librealsense::stream_profile` | `src/core/stream-profile.h:16` (added defaulted field) |
+| `platform::stream_profile` | `src/platform/stream-profile.h` |
+| `lazy<T>` | `rsutils::lazy<T>` |
+
+**Removed — needs replacement:**
+
+| Removed | Replacement | Sites |
+|---|---|---|
+| `environment::get_time_service()` | `librealsense::time_service::get_time()` (`src/core/time-service.h:19`, static) | 4 (`:1255,1455,1461,1564`) |
+| `internal_frame_callback<T>` | `librealsense::make_frame_callback()` (`src/core/frame-callback.h:34`) | 1 (`:841`) |
+| `hexify()` | `rsutils::string::hexdump` or a 3-line local helper | 1 (`:1981`) |
+| `tm2_extensions` | **re-add** ~10 lines to `src/core/motion.h`; `RS2_EXTENSION_TM2` enum survives | — |
+| `tm2_sensor_interface` | **re-add** ~10 lines; `RS2_EXTENSION_TM2_SENSOR` survives | — |
+| `rs2_loopback_*` | un-stub in `src/rs.cpp:3424-3441` (~20 lines) | — |
+
+**New requirements to satisfy:**
+
+- `get_raw_stream_profiles()` is a **new pure virtual** on `sensor_interface`
+  (`src/core/sensor-interface.h:38`) that `sensor_base` does not implement. Add:
+  `stream_profiles const & get_raw_stream_profiles() const override { return initialized_profiles(); }`
+- `pose_sensor_interface` and `wheel_odometry_interface` are **no longer `recordable<>`** —
+  **delete** the four `create_snapshot`/`enable_recording` overrides at `tm-device.h:136-139`.
+- Un-stub `src/rs.cpp:1960` and `:2001` (`return false` → `VALIDATE_INTERFACE_NO_THROW`).
+
+**Confirmed unchanged — no work needed:** the whole `src/usb/*` layer; all 8 option classes
+and `md_tm2_parser` (`tm-device.cpp:152-355`); `option_base` / `readonly_option` /
+`register_option`; `environment::get_extrinsics_graph().register_extrinsics()`;
+`register_stream_to_extrinsic_group`; `register_info` / `update_info`;
+`frame_additional_data` 10-arg ctor; `frame_source::invoke_callback`; `dispatcher`;
+`raise_on_before_streaming_changes`; `set_active_streams`; `ros_reader`; and the entire
+`rs2_export/import_localization_map`, static-node and wheel-odometry C API
+(`src/rs.cpp:3549-3648`).
 
 ### Phase 4 — Firmware delivery
 
@@ -333,10 +433,14 @@ Exposure to watch:
 
 | Risk | Severity | Notes |
 |---|---|---|
-| Phase 3 effort is unbounded | **High** | 2,170 lines against rearchitected bases; spike before scheduling |
+| **No build toolchain installed** | **BLOCKER** | §4a — nothing compiles or is testable until resolved |
+| Frame-pool retuning (Phase 3) | **High** | Archive keying changed; `set_max_publish_list_size` now per-archive. Compile-clean but drops frames. Hardware-only diagnosis |
+| Profile tagging / `format_conversion` | **High** | New machinery T265 predates; likely "enumerates but won't stream". Hardware-only diagnosis |
 | No hardware CI | **High** | Upstream will never test this path; silent breakage on merge |
-| Firmware URL retirement | Medium | Currently live; mirror the blob now |
-| `libusb` / `WITH_TRACKING` regressions | Medium | Verify across target platforms |
+| WinUSB driver binding on Win11 | Medium | Unverified whether binding is automatic; Windows-only problem |
+| ~~Phase 3 effort unbounded~~ | ~~High~~ → **Medium** | **Downgraded** — sized at ~2.5–3 weeks; 67% of lines compile untouched |
+| Firmware durability | Medium | Blob verified but not yet permanently mirrored |
+| `libusb` / `WITH_TRACKING` regressions | Low–Medium | `libusb_config.cmake` and `external_libusb.cmake` both survive; `add_tm2()` should port verbatim |
 | `is_same_as` collision (Phase 2) | Medium | Known and specified above; must not be missed |
 | Viewer/examples drift | Low | Deferrable |
 
