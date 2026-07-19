@@ -517,8 +517,8 @@ Exposure to watch:
 |---|---|---|
 | ~~No build toolchain installed~~ | ~~BLOCKER~~ → **RESOLVED** | §4a — toolchain installed and baseline `realsense2.dll` builds clean |
 | ATL missing → MF backend unbuildable | Medium | §4a — blocked on a pending reboot. Does not block T265 (RSUSB path), but blocks any D400 non-regression claim on the default Windows backend |
-| Frame-pool retuning (Phase 3) | **High** | Archive keying changed; `set_max_publish_list_size` now per-archive. Compile-clean but drops frames. Hardware-only diagnosis |
-| Profile tagging / `format_conversion` | **High** | New machinery T265 predates; likely "enumerates but won't stream". Hardware-only diagnosis |
+| ~~Frame-pool retuning~~ | ~~High~~ → **Low** | Did not materialise. All five streams ran concurrently with zero drops at the original 256 value. **Not yet soak-tested** — a few hundred framesets only, so keep the code comment as the first place to look if drops appear under sustained load |
+| ~~Profile tagging / `format_conversion`~~ | ~~High~~ → **RESOLVED** | Did not materialise. The full profile list enumerates correctly and `pipeline`/`config` resolve and start all five streams |
 | No hardware CI | **High** | Upstream will never test this path; silent breakage on merge |
 | ~~WinUSB driver binding on Win11~~ | ~~Medium~~ → **RESOLVED** | Windows 11 binds both the Movidius bootloader and the booted T265 with no manual driver install. A 9 MB bulk transfer to the unbooted device succeeded, so the binding is not merely present but usable |
 | ~~Phase 3 effort unbounded~~ | ~~High~~ → **Medium** | **Downgraded** — sized at ~2.5–3 weeks; 67% of lines compile untouched |
@@ -543,7 +543,7 @@ functionality. State plainly which of these each change has reached:
 | Compiles | Builds with `BUILD_WITH_TM2=ON` | ✅ 2026-07-18 |
 | Boots | Firmware pushed, device re-enumerates as `8087:0b37` | ✅ 2026-07-18 |
 | Enumerates | Device is found and listed by librealsense | ✅ 2026-07-18 |
-| Streams | Pose and fisheye frames arrive with sane values | ⬜ blocked on Phase 3 |
+| Streams | Pose and fisheye frames arrive with sane values | ✅ 2026-07-18 |
 | Round-trips | Record and playback reproduce pose data | ⬜ |
 
 **Evidence for the three achieved rungs** (hardware, 2026-07-18):
@@ -564,6 +564,27 @@ That error is the Phase 2 `create_device()` placeholder, and reaching it proves 
 chain: firmware push → re-enumeration → `query_usb_devices` → factory hook →
 `tm2_info::pick_tm2_devices` → device list → `create_device()`. The device is genuinely
 recognised as a T265, serial 845412110485.
+
+**Streaming evidence** (after Phase 3, same hardware):
+
+```
+Device: Intel RealSense T265  serial 845412110485
+pipeline: pose + fisheye x2 + gyro + accel
+
+pose  t=(-0.0000,-0.0002,-0.0000)  q=(0.7744,0.0273,0.0256,0.6316)  tracker=2 mapper=0
+pose  t=(-0.0002,-0.0004,-0.0002)  q=(0.7744,0.0264,0.0252,0.6316)  tracker=2 mapper=0
+...
+Frames received per stream:
+  Accel 400   Fisheye 1 400   Fisheye 2 400   Gyro 400   Pose 400
+```
+
+Data is sane, not merely present: translation sits near zero for a stationary device,
+tracker confidence reports 2 (high), and the quaternion norm computes to 1.00003 — a valid
+unit quaternion, which is good evidence the wire format is being parsed correctly rather
+than producing plausible-looking noise.
+
+All 400 framesets carried all five streams with no drops. Caveat: this is a run of a few
+hundred framesets, not a soak test — see the frame-pool note in §Risks.
 
 Phases 1–7 can reach *Compiles* with no hardware. **Nothing above that is provable without a
 physical T265.** Until a device streams, this restoration is unverified regardless of how
