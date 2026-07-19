@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <src/firmware-version.h>
+
+#include <src/hw-monitor.h>
+
 #include "../backend.h"
 #include "../types.h"
 #include "../option.h"
@@ -93,7 +97,7 @@ namespace librealsense
 #pragma pack(pop)
 
         static std::vector< byte >
-        read_fw_table_raw( const hw_monitor & hwm, int table_id, hwmon_response & response )
+        read_fw_table_raw( const hw_monitor & hwm, int table_id, hwmon_response_type & response )
         {
             std::vector< byte > res;
             command cmd( fw_cmd::READ_TABLE, table_id );
@@ -112,7 +116,7 @@ namespace librealsense
                             table_header * pheader = nullptr,
                             std::function< void() > init = nullptr )
         {
-            hwmon_response response;
+            hwmon_response_type response;
             std::vector< byte > data = read_fw_table_raw( hwm, table_id, response );
             size_t expected_size = sizeof( table_header ) + sizeof( T );
             switch( response )
@@ -162,7 +166,7 @@ namespace librealsense
 
             memcpy( cmd.data.data() + sizeof( table_header ), &table, sizeof( table ) );
             
-            hwmon_response response;
+            hwmon_response_type response;
             hwm.send( cmd, &response );
             switch( response )
             {

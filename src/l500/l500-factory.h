@@ -2,6 +2,8 @@
 // Copyright(c) 2015 Intel Corporation. All Rights Reserved.
 #pragma once
 
+#include <src/platform/backend-device-group.h>
+
 #include "l500-private.h"
 
 namespace librealsense

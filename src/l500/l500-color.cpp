@@ -13,6 +13,9 @@
 #include <mutex>
 
 
+#include <rsutils/type/fourcc.h>
+using rs_fourcc = rsutils::type::fourcc;
+
 namespace librealsense
 {
     using namespace ivcam2;
@@ -186,9 +189,9 @@ namespace librealsense
 
         // This lazy instance will get shared between all the extrinsics edges. If you ever need to override
         // it, be careful not to overwrite the shared-ptr itself (register_extrinsics) or the sharing
-        // will get ruined. Instead, overwriting the lazy<> function should do it:
+        // will get ruined. Instead, overwriting the rsutils::lazy<> function should do it:
         //      *_color_extrinsic = [=]() { return extr; };
-        _color_extrinsic = std::make_shared<lazy<rs2_extrinsics>>(
+        _color_extrinsic = std::make_shared<rsutils::lazy<rs2_extrinsics>>(
             [this]()
             {
                 return get_color_stream_extrinsic(*_color_extrinsics_table_raw);
@@ -198,7 +201,7 @@ namespace librealsense
 
         _thermal_table = [this]() {
 
-            hwmon_response response;
+            hwmon_response_type response;
             auto data = read_fw_table_raw( *_hw_monitor,
                                            algo::thermal_loop::l500::thermal_calibration_table::id,
                                            response );
@@ -368,7 +371,7 @@ namespace librealsense
         ++timestamp;
     }
 
-    void l500_color_sensor::start(frame_callback_ptr callback)
+    void l500_color_sensor::start(rs2_frame_callback_sptr callback)
     {
         std::lock_guard<std::mutex> lock(_state_mutex);
 

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <rsutils/lazy.h>
+
 #include <vector>
 #include <string>
 #include "device.h"
@@ -32,9 +34,9 @@ namespace librealsense
         optional_value<uint8_t> _motion_module_device_idx;
 
         std::shared_ptr<mm_calib_handler>        _mm_calib;
-        std::shared_ptr<lazy<ds::imu_intrinsic>> _accel_intrinsic;
-        std::shared_ptr<lazy<ds::imu_intrinsic>> _gyro_intrinsic;
-        std::shared_ptr<lazy<rs2_extrinsics>>   _depth_to_imu;                  // Mechanical installation pose
+        std::shared_ptr<rsutils::lazy<ds::imu_intrinsic>> _accel_intrinsic;
+        std::shared_ptr<rsutils::lazy<ds::imu_intrinsic>> _gyro_intrinsic;
+        std::shared_ptr<rsutils::lazy<rs2_extrinsics>>   _depth_to_imu;                  // Mechanical installation pose
 
     protected:
         std::shared_ptr<stream_interface> _accel_stream;

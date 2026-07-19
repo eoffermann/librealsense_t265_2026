@@ -272,7 +272,7 @@ namespace librealsense
         register_option(static_cast<rs2_option>(RS2_OPTION_FILTER_ZO_THRESHOLD_SCALE), scale);
     }
 
-    const char* zero_order::get_option_name(rs2_option option) const
+    std::string const & zero_order::get_option_name(rs2_option option) const
     {
         switch (static_cast<zero_order_invalidation_options>(option))
         {
@@ -283,17 +283,17 @@ namespace librealsense
         case zero_order_invalidation_options::RS2_OPTION_FILTER_ZO_RTD_LOW_THRESHOLD:
             return "RTD Low Threshold";
         case zero_order_invalidation_options::RS2_OPTION_FILTER_ZO_BASELINE:
-            return "Baseline";
+            { static const std::string sbaseline = "Baseline"; return sbaseline; }
         case zero_order_invalidation_options::RS2_OPTION_FILTER_ZO_PATCH_SIZE:
-            return "Patch size";
+            { static const std::string spatch_size = "Patch size"; return spatch_size; }
         case zero_order_invalidation_options::RS2_OPTION_FILTER_ZO_MAX_VALUE:
-            return "ZO max value";
+            { static const std::string szo_max = "ZO max value"; return szo_max; }
         case zero_order_invalidation_options::RS2_OPTION_FILTER_ZO_IR_MIN_VALUE:
-            return "IR min value";
+            { static const std::string sir_min = "IR min value"; return sir_min; }
         case zero_order_invalidation_options::RS2_OPTION_FILTER_ZO_THRESHOLD_OFFSET:
-            return "Threshold offset";
+            { static const std::string sthr_off = "Threshold offset"; return sthr_off; }
         case zero_order_invalidation_options::RS2_OPTION_FILTER_ZO_THRESHOLD_SCALE:
-            return "Threshold scale";
+            { static const std::string sthr_scale = "Threshold scale"; return sthr_scale; }
         }
 
         return options_container::get_option_name(option);

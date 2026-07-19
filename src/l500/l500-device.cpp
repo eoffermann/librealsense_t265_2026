@@ -20,7 +20,7 @@
 #include <src/proc/syncer-processing-block.h>
 #include <src/proc/rotation-transform.h>
 
-#include <common/fw/firmware-version.h>
+#include <src/firmware-version.h>
 #include <rsutils/time/periodic-timer.h>
 #include <rsutils/time/work-week.h>
 #include <common/utilities/time/l500/get-mfr-ww.h>
@@ -28,6 +28,9 @@
 
 #include <vector>
 
+
+#include <rsutils/type/fourcc.h>
+using rs_fourcc = rsutils::type::fourcc;
 
 namespace librealsense
 {
@@ -376,7 +379,7 @@ namespace librealsense
         }
     }
 
-    std::vector<uint8_t> l500_device::backup_flash(update_progress_callback_ptr callback)
+    std::vector<uint8_t> l500_device::backup_flash(rs2_update_progress_callback_sptr callback)
     {
         int flash_size = 1024 * 2048;
         int max_bulk_size = 1016;
@@ -426,7 +429,7 @@ namespace librealsense
         return flash;
     }
 
-    void l500_device::update_flash_section(std::shared_ptr<hw_monitor> hwm, const std::vector<uint8_t>& image, uint32_t offset, uint32_t size, update_progress_callback_ptr callback, float continue_from, float ratio)
+    void l500_device::update_flash_section(std::shared_ptr<hw_monitor> hwm, const std::vector<uint8_t>& image, uint32_t offset, uint32_t size, rs2_update_progress_callback_sptr callback, float continue_from, float ratio)
     {
         int sector_count = int( size / ivcam2::FLASH_SECTOR_SIZE );
         int first_sector = int( offset / ivcam2::FLASH_SECTOR_SIZE );
@@ -468,7 +471,7 @@ namespace librealsense
     }
 
     void l500_device::update_section(std::shared_ptr<hw_monitor> hwm, const std::vector<uint8_t>& merged_image, flash_section fs, uint32_t tables_size,
-        update_progress_callback_ptr callback, float continue_from, float ratio)
+        rs2_update_progress_callback_sptr callback, float continue_from, float ratio)
     {
         auto first_table_offset = fs.tables.front().offset;
         float total_size = float(fs.app_size + tables_size);
@@ -480,7 +483,7 @@ namespace librealsense
         update_flash_section(hwm, merged_image, first_table_offset, tables_size, callback, app_ratio, tables_ratio);
     }
 
-    void l500_device::update_flash_internal(std::shared_ptr<hw_monitor> hwm, const std::vector<uint8_t>& image, std::vector<uint8_t>& flash_backup, update_progress_callback_ptr callback, int update_mode)
+    void l500_device::update_flash_internal(std::shared_ptr<hw_monitor> hwm, const std::vector<uint8_t>& image, std::vector<uint8_t>& flash_backup, rs2_update_progress_callback_sptr callback, int update_mode)
     {
         auto flash_image_info = ivcam2::get_flash_info(image);
         auto flash_backup_info = ivcam2::get_flash_info(flash_backup);
@@ -500,7 +503,7 @@ namespace librealsense
         }
     }
 
-    void l500_device::update_flash(const std::vector<uint8_t>& image, update_progress_callback_ptr callback, int update_mode)
+    void l500_device::update_flash(const std::vector<uint8_t>& image, rs2_update_progress_callback_sptr callback, int update_mode)
     {
         if (_is_locked)
             throw std::runtime_error("this camera is locked and doesn't allow direct flash write, for firmware update use rs2_update_firmware method (DFU)");

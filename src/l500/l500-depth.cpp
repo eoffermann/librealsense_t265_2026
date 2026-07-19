@@ -195,7 +195,7 @@ namespace librealsense
     class frame_filter : public rs2_frame_callback
     {
     public:
-        explicit frame_filter(frame_callback_ptr user_callback, const stream_profiles &user_requests) :
+        explicit frame_filter(rs2_frame_callback_sptr user_callback, const stream_profiles &user_requests) :
             _user_callback(user_callback),
             _user_requests(user_requests) {}
 
@@ -237,7 +237,7 @@ namespace librealsense
                 vl->get_stream_type() == vr->get_stream_type();
         }
 
-        frame_callback_ptr _user_callback;
+        rs2_frame_callback_sptr _user_callback;
         stream_profiles _user_requests;
     };
 
@@ -256,11 +256,11 @@ namespace librealsense
     {
 
         register_option( RS2_OPTION_DEPTH_UNITS, std::make_shared<const_value_option>( "Number of meters represented by a single depth unit",
-            lazy<float>( [&]() {
+            rsutils::lazy<float>( [&]() {
                 return read_znorm(); } ) ) );
 
         register_option( RS2_OPTION_DEPTH_OFFSET, std::make_shared<const_value_option>( "Offset from sensor to depth origin in millimetrers",
-            lazy<float>( [&]() {
+            rsutils::lazy<float>( [&]() {
                 return get_depth_offset(); } ) ) );
 
     }
@@ -407,7 +407,7 @@ namespace librealsense
         return res;
     }
 
-    void l500_depth_sensor::start(frame_callback_ptr callback)
+    void l500_depth_sensor::start(rs2_frame_callback_sptr callback)
     {
         if (supports_option(RS2_OPTION_HOST_PERFORMANCE))
         {

@@ -24,7 +24,7 @@ namespace librealsense
         l500_update_device(std::shared_ptr<context> ctx, bool register_device_notifications, std::shared_ptr<platform::usb_device> usb_device);
         virtual ~l500_update_device() = default;
 
-        void update(const void* fw_image, int fw_image_size, update_progress_callback_ptr = nullptr) const override;
+        void update(const void* fw_image, int fw_image_size, rs2_update_progress_callback_sptr = nullptr) const override;
         virtual bool check_fw_compatibility(const std::vector<uint8_t>& image) const override;
 
     protected:

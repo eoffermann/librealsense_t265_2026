@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <src/color-sensor.h>
+
+#include <rsutils/lazy.h>
+
 #include <vector>
 #include <string>
 #include <map>
@@ -39,10 +43,10 @@ namespace librealsense
 
         uint8_t _color_device_idx = -1;
 
-        lazy<ivcam2::intrinsic_rgb> _color_intrinsics_table;
-        lazy<std::vector<uint8_t>> _color_extrinsics_table_raw;
-        std::shared_ptr<lazy<rs2_extrinsics>> _color_extrinsic;
-        lazy< algo::thermal_loop::l500::thermal_calibration_table > _thermal_table;
+        rsutils::lazy<ivcam2::intrinsic_rgb> _color_intrinsics_table;
+        rsutils::lazy<std::vector<uint8_t>> _color_extrinsics_table_raw;
+        std::shared_ptr<rsutils::lazy<rs2_extrinsics>> _color_extrinsic;
+        rsutils::lazy< algo::thermal_loop::l500::thermal_calibration_table > _thermal_table;
 
         ivcam2::intrinsic_rgb read_intrinsics_table() const;
         std::vector<uint8_t> get_raw_extrinsics_table() const;
@@ -119,7 +123,7 @@ namespace librealsense
         void close() override;
     
         // Start the color sensor streaming
-        void start(frame_callback_ptr callback) override;
+        void start(rs2_frame_callback_sptr callback) override;
         
         // Stops the color sensor streaming
         void stop() override;
@@ -141,7 +145,7 @@ namespace librealsense
 
         std::atomic< sensor_state > _state;
 
-        void delayed_start(frame_callback_ptr callback)
+        void delayed_start(rs2_frame_callback_sptr callback)
         {
             LOG_DEBUG("Starting color sensor...");
             // The delay is here as a work around to a firmware bug [RS5-5453]

@@ -23,3 +23,10 @@ target_sources(${LRS_TARGET}
         "${CMAKE_CURRENT_LIST_DIR}/l500-options.h"
 )
 
+# get-mfr-ww lives under common/ but is used by the L500 device layer (manufacturing
+# work-week decoding). Compiled in here so realsense2 is self-contained.
+target_sources(${LRS_TARGET}
+    PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/../../common/utilities/time/l500/get-mfr-ww.h"
+        "${CMAKE_CURRENT_LIST_DIR}/../../common/utilities/time/l500/get-mfr-ww.cpp"
+)

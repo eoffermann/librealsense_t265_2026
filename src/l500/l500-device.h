@@ -3,6 +3,12 @@
 
 #pragma once
 
+#include <src/firmware-version.h>
+
+// Types below moved out of the headers that used to provide them transitively.
+#include <src/core/debug.h>
+#include <src/platform/backend-device-group.h>
+
 #include <vector>
 #include <mutex>
 #include <string>
@@ -66,14 +72,14 @@ namespace librealsense
         double get_device_time_ms() override;
 
         void enter_update_state() const override;
-        std::vector<uint8_t> backup_flash(update_progress_callback_ptr callback) override;
-        void update_flash(const std::vector<uint8_t>& image, update_progress_callback_ptr callback, int update_mode) override;
+        std::vector<uint8_t> backup_flash(rs2_update_progress_callback_sptr callback) override;
+        void update_flash(const std::vector<uint8_t>& image, rs2_update_progress_callback_sptr callback, int update_mode) override;
         void update_flash_section(std::shared_ptr<hw_monitor> hwm, const std::vector<uint8_t>& image, uint32_t offset, uint32_t size, 
-            update_progress_callback_ptr callback, float continue_from, float ratio);
+            rs2_update_progress_callback_sptr callback, float continue_from, float ratio);
         void update_section(std::shared_ptr<hw_monitor> hwm, const std::vector<uint8_t>& merged_image, flash_section fs, uint32_t tables_size,
-            update_progress_callback_ptr callback, float continue_from, float ratio);
+            rs2_update_progress_callback_sptr callback, float continue_from, float ratio);
         void update_flash_internal(std::shared_ptr<hw_monitor> hwm, const std::vector<uint8_t>& image, std::vector<uint8_t>& flash_backup,
-            update_progress_callback_ptr callback, int update_mode);
+            rs2_update_progress_callback_sptr callback, int update_mode);
         bool check_fw_compatibility(const std::vector<uint8_t>& image) const override;
 
         ivcam2::extended_temperatures get_temperatures() const;
@@ -90,7 +96,7 @@ namespace librealsense
 
         std::shared_ptr<polling_error_handler> _polling_error_handler;
 
-        lazy<ivcam2::intrinsic_depth> _calib_table;
+        rsutils::lazy<ivcam2::intrinsic_depth> _calib_table;
         firmware_version _fw_version;
         std::shared_ptr<stream_interface> _depth_stream;
         std::shared_ptr<stream_interface> _ir_stream;

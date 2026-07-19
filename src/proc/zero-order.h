@@ -56,7 +56,7 @@ namespace librealsense
     private:
         bool should_process(const rs2::frame& frame) override;
         rs2::frame prepare_output(const rs2::frame_source& source, rs2::frame input, std::vector<rs2::frame> results) override;
-        const char * get_option_name(rs2_option option) const override;
+        std::string const & get_option_name(rs2_option option) const override;
         bool try_read_baseline(const rs2::frame& frame);
         ivcam2::intrinsic_params try_read_intrinsics(const rs2::frame& frame);
 

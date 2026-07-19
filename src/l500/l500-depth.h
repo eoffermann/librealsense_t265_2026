@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <src/depth-sensor.h>
+
+#include <src/platform/backend-device-group.h>
+
 #include <vector>
 #include <mutex>
 #include <string>
@@ -258,7 +262,7 @@ namespace librealsense
         float read_baseline() const override;
         float read_znorm();
 
-        void start(frame_callback_ptr callback) override;
+        void start(rs2_frame_callback_sptr callback) override;
         void open(const stream_profiles& requests) override;
         void stop() override;
         float get_depth_offset() const;

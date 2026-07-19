@@ -4,7 +4,7 @@
 #include "l500-options.h"
 #include "l500-private.h"
 #include "l500-depth.h"
-#include "../common/fw/firmware-version.h"
+#include <src/firmware-version.h>
 
 #include <rsutils/string/from.h>
 
@@ -134,7 +134,7 @@ namespace librealsense
     float l500_hw_options::query_new_fw_default( bool & success ) const
     {
         success = true;
-        hwmon_response response;
+        hwmon_response_type response;
         auto res = _hw_monitor->send(
             command{ AMCGET,
                      _type,

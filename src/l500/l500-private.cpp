@@ -16,6 +16,8 @@
 
 using namespace std;
 
+#include <src/pose.h>
+
 namespace librealsense
 {
     namespace ivcam2
