@@ -886,9 +886,15 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 \
       -DBUILD_EXAMPLES=ON -DBUILD_GRAPHICAL_EXAMPLES=ON -DBUILD_TOOLS=ON
 ```
 
-No `FORCE_RSUSB_BACKEND`. This configuration is verified to build clean and to enumerate D435
-(`5.11.15`, product line D400), L515 and T265. T265 still works here because it goes through
-the raw-USB layer regardless of which UVC backend is selected — the two are independent.
+No `FORCE_RSUSB_BACKEND`. Verified to enumerate D435, L515 and T265 together.
+
+> ⚠️ **This section originally claimed T265 "still works here because it goes through the
+> raw-USB layer regardless of which UVC backend is selected." That claim was asserted, not
+> tested, and it was wrong.** `tm_boot()` was only wired into
+> `src/rsusb-backend/rsusb-backend.cpp`, which is *not compiled* for the Media Foundation
+> backend — so an unbooted T265 never received firmware and never appeared. The original code
+> called `tm_boot` from **three** backends (v4l2, mf, rsusb); only one had been restored. Fixed
+> by adding the hook to the MF and V4L2 backends as well.
 
 **Symptom to recognise:** if a camera that should be supported enumerates as nothing at all,
 check `FORCE_RSUSB_BACKEND` in that build's `CMakeCache.txt` before suspecting the driver.
