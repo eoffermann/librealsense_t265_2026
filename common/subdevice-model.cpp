@@ -1163,6 +1163,25 @@ namespace rs2
         return res;
     }
 
+    std::pair< int, int > subdevice_model::effective_resolution_for( rs2_stream stream_type,
+                                                                     std::pair< int, int > shared ) const
+    {
+        auto it = resolutions_per_stream.find( stream_type );
+        if( it == resolutions_per_stream.end() || it->second.empty() )
+            return shared;
+
+        // Most sensors offer the same resolutions on every video stream, so the shared
+        // selection just works. It does not hold universally: the T265 exposes 848x800
+        // fisheye alongside a 300x300 host-computed depth map on one sensor. Matching that
+        // depth stream against 848x800 finds nothing, the combination is reported
+        // unsupported, and the stream cannot be enabled at all. Where a stream does not
+        // offer the shared resolution, match it against its own instead.
+        if( std::find( it->second.begin(), it->second.end(), shared ) != it->second.end() )
+            return shared;
+
+        return it->second.front();
+    }
+
     bool subdevice_model::is_selected_combination_supported()
     {
         bool enforce_inter_stream_policies = false;
@@ -1786,7 +1805,9 @@ namespace rs2
                                 {
                                     if (!ui.is_multiple_resolutions)
                                     {
-                                        if (vid_prof.width() == width && vid_prof.height() == height)
+                                        auto const eff = effective_resolution_for( p.stream_type(),
+                                                                                   { width, height } );
+                                        if (vid_prof.width() == eff.first && vid_prof.height() == eff.second)
                                             results.push_back(p);
                                     }
                                     else

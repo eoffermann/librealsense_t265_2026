@@ -10,10 +10,19 @@
 #include "../core/motion.h"
 #include "../media/playback/playback_device.h"
 
+#include "../depth-sensor.h"
 #include "../usb/usb-device.h"
 #include "../usb/usb-messenger.h"
 
 #include "t265-messages.h"
+
+#include <src/proc/t265-stereo-rectify.h>
+#include <src/proc/t265-stereo-match.h>
+
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 namespace librealsense
 {
@@ -80,7 +89,8 @@ namespace librealsense
     };
 
     class tm2_sensor : public sensor_base, public video_sensor_interface, public wheel_odometry_interface,
-                       public pose_sensor_interface, public tm2_sensor_interface
+                       public pose_sensor_interface, public tm2_sensor_interface,
+                       public depth_sensor
     {
     public:
         tm2_sensor(tm2_device* owner);
@@ -100,6 +110,12 @@ namespace librealsense
         rs2_intrinsics get_intrinsics(const stream_profile& profile) const override;
         rs2_motion_device_intrinsic get_motion_intrinsics(const motion_stream_profile_interface& profile) const;
         rs2_extrinsics get_extrinsics(const stream_profile_interface & profile, int sensor_id) const;
+
+        // depth_sensor. The device has no depth hardware; this describes the depth map
+        // synthesised on the host from the fisheye pair. Millimetre units keep the full
+        // 8m working range inside a uint16.
+        static constexpr float DEPTH_UNITS = 0.001f;
+        float get_depth_scale() const override { return DEPTH_UNITS; }
 
         void enable_loopback(std::shared_ptr<playback_device> input);
         void disable_loopback();
@@ -167,6 +183,49 @@ namespace librealsense
         std::vector<t265::supported_raw_stream_libtm_message> _active_raw_streams;
         bool _pose_output_enabled{false};
         tm2_device * _device;
+
+        // ---- host-side stereo depth -------------------------------------------------
+        //
+        // The T265 has no depth hardware, but its two fisheye cameras are a calibrated
+        // stereo pair, so depth is computed on the host from the rectified pair. Like the
+        // pose stream this is "special": it is not a raw stream the device can be asked
+        // for, it is synthesised here.
+        //
+        // Matching costs a few hundred milliseconds per frame, far too long to run on the
+        // USB callback thread, so it happens on a worker. The worker always processes the
+        // most recent complete pair and drops anything that arrives while it is busy --
+        // depth simply runs at a lower rate than the fisheye streams.
+
+        void build_stereo_maps();
+        void start_stereo_worker();
+        void stop_stereo_worker();
+        void stereo_worker();
+        void submit_fisheye_for_depth( int sensor_id, uint8_t const * data,
+                                       int width, int height, double timestamp,
+                                       unsigned long long frame_number );
+
+        bool _depth_output_enabled{ false };
+        // Enabling depth switches both fisheye cameras on internally. These record whether
+        // the caller actually asked to see fisheye 1 / fisheye 2, so frames pulled in purely
+        // to feed the matcher are consumed rather than published.
+        bool _fisheye_requested[2]{ false, false };
+        std::shared_ptr< stream_profile_interface > _depth_profile;
+
+        t265_stereo::rectified_config _stereo_cfg;
+        t265_stereo::matcher_config   _matcher_cfg;
+        t265_stereo::remap_table      _remap_left, _remap_right;
+        float _stereo_baseline{ 0.f };
+        bool  _stereo_maps_ready{ false };
+
+        std::mutex               _stereo_mutex;
+        std::condition_variable  _stereo_cv;
+        std::thread              _stereo_thread;
+        std::atomic< bool >      _stereo_stop{ false };
+
+        std::vector< uint8_t > _pending_left, _pending_right;
+        bool                   _have_left{ false }, _have_right{ false };
+        double                 _pending_timestamp{ 0.0 };
+        unsigned long long     _pending_frame_number{ 0 };
 
         void print_logs(const std::unique_ptr<t265::bulk_message_response_get_and_clear_event_log> & log);
 
