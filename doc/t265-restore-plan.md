@@ -23,7 +23,7 @@ driver, forward-port it onto current upstream code, and keep merging upstream as
 | Camera | Removed upstream | Status |
 |---|---|---|
 | **T265 / TM2** | 2023-01-04, after `v2.53.1` | ✅ Working — §1–§9 |
-| **L515 / L500** | 2023-07-12 | 🚧 Not yet scoped — §10 |
+| **L515 / L500** | 2023-07-12 | ✅ Enumerates and streams — §10–§11 |
 
 ---
 
@@ -679,7 +679,7 @@ This also closes the outstanding "cannot claim D400-class cameras are unregresse
 
 ---
 
-## 11. L500 status — 2026-07-19 (COMPILES CLEAN)
+## 11. L500 status — 2026-07-19 (ENUMERATES AND STREAMS)
 
 Branch `l500-restore`, off `master`. **`BUILD_WITH_L500` defaults OFF**, so none of this can
 affect a normal build. T265 remains working and unaffected.
@@ -790,3 +790,69 @@ with no L515 attached.
 line count might suggest. The reason is that `d400_device` is a working, line-by-line template
 for every structural change here, which T265 never had. The risk is not compile volume; it is
 the runtime list above.
+
+---
+
+## 12. L500 hardware verification — 2026-07-19
+
+**The L515 enumerates and streams.** All on the attached camera (serial `f0232365`, firmware
+`1.5.0`), built with the Media Foundation backend and `BUILD_WITH_L500=ON`.
+
+```
+Name                         : Intel RealSense L515
+Serial Number                : f0232365
+Firmware Version             : 1.5.0
+Recommended Firmware Version : 1.5.8.1
+Product Line                 : L500      Product Id : 0B64
+```
+
+### Streaming results
+
+| Mode | Result |
+|---|---|
+| depth | 120 frames |
+| depth + infrared | 120 + 120 |
+| **depth + confidence** | **120 + 120** — the `composite_processing_block` path |
+| color | 120 |
+| accel + gyro | 120 + 120 |
+| depth + IR + color together | 120 each |
+
+**Depth data is real, not merely present:** ~20% pixel coverage with raw values in
+`[1960 .. 32808]` at `0.00025 m` units — that is **0.49 m to 8.2 m**, exactly L515's
+operating range. The zero centre pixel is simply no return at that point.
+
+### Runtime risks — resolved by evidence
+
+| Risk | Outcome |
+|---|---|
+| 1. `composite_processing_block` in `formats_converter` | ✅ **Did not materialise.** Depth+confidence stream together |
+| 2. One-to-many profile fan-out (DEPTH *and* CONFIDENCE from one source set) | ✅ **Works.** Both enumerate and stream |
+| 3. `get_profiles_tags()` vs `format_conversion` | ✅ Full profile set enumerates correctly |
+| 4. `get_firmware_version_string` template/`reversed` | ✅ **Verified.** Reports `1.5.0`; byte order checked against the pre-removal implementation |
+| 5. `hwmon_response_type` width | ✅ Hardware-monitor reads succeed (version, serials, ASIC serial) |
+
+### Bug caught by verification, not by the compiler
+
+`l500_confidence_resolution` was reimplemented from its name rather than from the original.
+The original is `resolution{ res.height, res.width * 2 }` — the axes swap **and** the doubling
+lands on the new *height*. The first version doubled the width instead.
+
+It compiled, enumerated, and produced confidence profiles of `2048x384` that looked entirely
+plausible in isolation. Correct is `1024x768`, matching depth — one confidence value per depth
+pixel. Confirmed arithmetically: depth comes from a Z16 source at `768x1024` rotating to
+`1024x768`; confidence comes from a **RAW8 source at `384x1024`** mapping to
+`{1024, 384*2}` = `1024x768`. The buggy `2048x384` is exactly what swap-then-double-width
+yields from that same source — which is how the wrong version was confirmed to have been live
+rather than dormant.
+
+**Nothing would have flagged this until frames arrived malformed.** It was caught only by
+going back to check a value that had been guessed rather than derived — the same reason the
+firmware-version byte order was checked.
+
+### Still outstanding
+
+- **Viewer not yet tested** with L515
+- Record/playback round-trip (same gap as T265)
+- No soak testing; all runs are 120 frames
+- `src/ivcam/` still deliberately not restored — the compiler never asked for it across ~20
+  build rounds, which settles the earlier disagreement in favour of leaving it out
