@@ -1,54 +1,33 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2017 Intel Corporation. All Rights Reserved.
+// Copyright(c) 2017-2026 RealSense, Inc. All Rights Reserved.
 
 #pragma once
 
-#include "../usb/usb-device.h"
-#include "../usb/usb-enumerator.h"
-#include "../types.h"
+#include <src/usb/usb-types.h>
 
-#ifdef WITH_TRACKING
-#include "common/fw/target.h"
-#endif
+#include <vector>
 
 namespace librealsense {
-    namespace platform {
-#ifdef WITH_TRACKING
-        bool tm_boot(const std::vector<usb_device_info> & devices)
-        {
-            bool found = false;
-            for(const auto & device_info : devices) {
-                if(device_info.vid == 0x03E7 && device_info.pid == 0x2150) {
-                    LOG_INFO("Found a T265 to boot");
-                    found = true;
-                    auto dev = usb_enumerator::create_usb_device(device_info);
-                     if (const auto& m = dev->open(0))
-                     {
-                        // transfer the firmware data
-                        int size{};
-                        auto target_hex = fw_get_target(size);
+namespace platform {
 
-                        if(!target_hex)
-                            LOG_ERROR("librealsense failed to get T265 FW resource");
 
-                        auto iface = dev->get_interface(0);
-                        auto endpoint = iface->first_endpoint(RS2_USB_ENDPOINT_DIRECTION_WRITE);
-                        uint32_t transfered = 0;
-                        auto status = m->bulk_transfer(endpoint, const_cast<uint8_t*>(target_hex), static_cast<uint32_t>(size), transfered, 1000);
-                        if(status != RS2_USB_STATUS_SUCCESS)
-                            LOG_ERROR("Error booting T265");
-                    }
-                    else
-                        LOG_ERROR("Failed to open T265 zero interface");
-                }
-            }
-            return found;
-        }
-#else
-        bool tm_boot(const std::vector<usb_device_info> & devices)
-        {
-            return false;
-        }
-#endif
-    }
-}
+// Sends firmware to any unbooted T265 found in `devices`.
+//
+// T265 is a FW-less device: it holds no firmware of its own and must be sent an image on
+// every power-up. Until that happens it enumerates as a Movidius bootloader
+// (VID 0x03E7, PID 0x2150). Once booted it re-enumerates as a T265 proper
+// (VID 0x8087, PID 0x0B37), which is the PID tm2_info::pick_tm2_devices matches.
+//
+// Returns true if at least one unbooted device was found -- whether or not booting it
+// succeeded -- to tell the caller the USB device list is about to change and is worth
+// re-querying.
+//
+// The firmware image location is taken from the RS2_T265_FW_PATH environment variable.
+// This is an interim mechanism: upstream removed firmware bundling entirely, so Phase 4
+// of the restoration plan decides how the image is delivered properly.
+//
+bool tm_boot( const std::vector< usb_device_info > & devices );
+
+
+}  // namespace platform
+}  // namespace librealsense

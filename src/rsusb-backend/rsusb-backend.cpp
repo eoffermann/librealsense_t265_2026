@@ -9,6 +9,10 @@
 #include "../hid/hid-device.h"
 #include "../usb/usb-enumerator.h"
 #include "../core/time-service.h"
+#ifdef WITH_TRACKING
+#include "../tm2/tm-boot.h"
+#include <thread>
+#endif
 
 #include <chrono>
 #include <cctype> // std::tolower
@@ -52,6 +56,16 @@ namespace librealsense
         std::vector<usb_device_info> rs_backend::query_usb_devices() const
         {
             auto device_infos = usb_enumerator::query_devices_info();
+#ifdef WITH_TRACKING
+            // An unbooted T265 has to be sent its firmware before it can be enumerated as a
+            // tracking device. Give it a chance to restart; if we miss the window here the
+            // device watcher picks it up on a later pass anyway.
+            if( tm_boot( device_infos ) )
+            {
+                std::this_thread::sleep_for( std::chrono::milliseconds( 2000 ) );
+                device_infos = usb_enumerator::query_devices_info();
+            }
+#endif
             return device_infos;
         }
 

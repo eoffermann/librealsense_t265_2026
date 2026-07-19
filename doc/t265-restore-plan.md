@@ -425,18 +425,33 @@ and `md_tm2_parser` (`tm-device.cpp:152-355`); `option_base` / `readonly_option`
 `rs2_export/import_localization_map`, static-node and wheel-odometry C API
 (`src/rs.cpp:3549-3648`).
 
-### Phase 4 — Firmware delivery
+### Phase 4 — Firmware delivery — 🟡 **INTERIM MECHANISM WORKING 2026-07-18**
 
-Upstream deliberately deleted the bundling machinery, so do not resurrect `common/fw/`.
+Upstream deliberately deleted the bundling machinery, so `common/fw/` is not resurrected.
 
-**Recommended:** load `target-0.2.0.951.mvcmd` from disk at runtime via a configurable path,
-with CMake optionally fetching and verifying it (SHA1 above). Rationale:
+**Implemented:** `tm_boot()` loads the firmware image from the path in the
+`RS2_T265_FW_PATH` environment variable and sends it over a single bulk transfer.
+`src/tm2/tm-boot.cpp` is called from `rs_backend::query_usb_devices()`, so any unbooted
+device is booted as a side effect of normal enumeration.
 
-- Avoids re-adding a subsystem upstream removed — which would conflict on every future merge
-- Decouples the build from an EOL download URL
-- Keeps the firmware blob out of git history
+**This has been exercised against real hardware and works** — see the boot log below.
 
-Mirror the blob to internal storage regardless of which option is chosen.
+Deliberate departures from the original implementation:
+
+- **Firmware from file, not a linked resource.** The original called `fw_get_target()` from
+  the generated `common/fw/target.h`. That machinery is gone and is not coming back.
+- **`.h`/`.cpp` split.** The original defined `tm_boot()` in the header, which only worked
+  because exactly one translation unit included it.
+- **Timeout raised 1s → 15s.** ~9 MB in a single bulk transfer is tight at one second even on
+  a healthy link; the generous value keeps a slow-but-working transfer from being misreported
+  as a failure.
+- **Partial transfers reported distinctly from failures.** A short write means the link or
+  timeout is at fault, not the image or endpoint — worth being able to tell apart at 3am.
+
+**Still outstanding — the env var is not a shipping design.** It is fine for development but
+requires every user to obtain and place a blob manually. A real answer (CMake fetch-and-verify
+into a known location, a documented install path, or an internal mirror) is still owed, along
+with the permanent mirror noted in §3.
 
 ### Phase 5 — Restore API surface
 
@@ -505,7 +520,7 @@ Exposure to watch:
 | Frame-pool retuning (Phase 3) | **High** | Archive keying changed; `set_max_publish_list_size` now per-archive. Compile-clean but drops frames. Hardware-only diagnosis |
 | Profile tagging / `format_conversion` | **High** | New machinery T265 predates; likely "enumerates but won't stream". Hardware-only diagnosis |
 | No hardware CI | **High** | Upstream will never test this path; silent breakage on merge |
-| WinUSB driver binding on Win11 | Medium | Unverified whether binding is automatic; Windows-only problem |
+| ~~WinUSB driver binding on Win11~~ | ~~Medium~~ → **RESOLVED** | Windows 11 binds both the Movidius bootloader and the booted T265 with no manual driver install. A 9 MB bulk transfer to the unbooted device succeeded, so the binding is not merely present but usable |
 | ~~Phase 3 effort unbounded~~ | ~~High~~ → **Medium** | **Downgraded** — sized at ~2.5–3 weeks; 67% of lines compile untouched |
 | Firmware durability | Medium | Blob verified but not yet permanently mirrored |
 | `libusb` / `WITH_TRACKING` regressions | Low–Medium | `libusb_config.cmake` and `external_libusb.cmake` both survive; `add_tm2()` should port verbatim |
@@ -523,13 +538,32 @@ main tool available when a merge from upstream silently breaks tracking.
 **Verify before claiming.** A commit that restores code is not a commit that restores
 functionality. State plainly which of these each change has reached:
 
-| Level | Meaning |
-|---|---|
-| Compiles | Builds with `BUILD_WITH_TM2=ON` |
-| Enumerates | Device appears in `rs-enumerate-devices` |
-| Boots | Firmware pushed, device re-enumerates as `8087:0b37` |
-| Streams | Pose and fisheye frames arrive with sane values |
-| Round-trips | Record and playback reproduce pose data |
+| Level | Meaning | Status |
+|---|---|---|
+| Compiles | Builds with `BUILD_WITH_TM2=ON` | ✅ 2026-07-18 |
+| Boots | Firmware pushed, device re-enumerates as `8087:0b37` | ✅ 2026-07-18 |
+| Enumerates | Device is found and listed by librealsense | ✅ 2026-07-18 |
+| Streams | Pose and fisheye frames arrive with sane values | ⬜ blocked on Phase 3 |
+| Round-trips | Record and playback reproduce pose data | ⬜ |
+
+**Evidence for the three achieved rungs** (hardware, 2026-07-18):
+
+```
+before:  USB\VID_03E7&PID_2150\03E72150            Movidius MA2X5X
+         (unbooted T265 -- a Movidius bootloader)
+
+$ RS2_T265_FW_PATH=target-0.2.0.951.mvcmd rs-enumerate-devices
+  ERROR [rs2_create_device] Not Implemented
+  T265 support is still being ported: the device enumerates but cannot yet be opened
+
+after:   USB\VID_8087&PID_0B37\845412110485        Intel(R) RealSense(TM) Tracking Camera T265
+         Status: OK
+```
+
+That error is the Phase 2 `create_device()` placeholder, and reaching it proves the whole
+chain: firmware push → re-enumeration → `query_usb_devices` → factory hook →
+`tm2_info::pick_tm2_devices` → device list → `create_device()`. The device is genuinely
+recognised as a T265, serial 845412110485.
 
 Phases 1–7 can reach *Compiles* with no hardware. **Nothing above that is provable without a
 physical T265.** Until a device streams, this restoration is unverified regardless of how
