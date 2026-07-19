@@ -8,13 +8,54 @@
 #include <memory>
 #include <thread>
 #include <inttypes.h> // PRIu64
+#include <iomanip>
+#include <sstream>
 #include "tm-device.h"
 #include "stream.h"
 #include "media/playback/playback_device.h"
+#include "media/playback/playback-device-info.h"
 #include "media/ros/ros_reader.h"
 #include "usb/usb-enumerator.h"
+#include "tm-info.h"
+
+// Frame types used to live in archive.h / types.h and arrived transitively. They now each
+// have their own header under src/core/.
+#include "core/frame-callback.h"
+#include "core/frame-holder.h"
+#include "core/motion-frame.h"
+#include "core/pose-frame.h"
+#include "core/video-frame.h"
+#include "core/time-service.h"
+#include "image.h"  // get_image_bpp
 
 #include <rsutils/string/from.h>
+
+namespace {
+
+    // librealsense::copy_array / copy_2darray used to live in src/types.h and were removed
+    // upstream. Only T265 used them, so equivalents live here rather than being pushed back
+    // into shared headers. The originals took a force-narrowing flag guarded by static_assert;
+    // every call site here narrows deliberately (double -> float), so the casts are explicit
+    // and the flag is dropped.
+    template< typename T, size_t N, typename S, size_t M >
+    void copy_array( T ( &dst )[N], const S ( &src )[M] )
+    {
+        static_assert( N == M && N > 0, "copy_array requires equal, non-zero sizes" );
+        for( size_t i = 0; i < N; ++i )
+            dst[i] = static_cast< T >( src[i] );
+    }
+
+    template< typename T, size_t N1, size_t N2, typename S, size_t M1, size_t M2 >
+    void copy_2darray( T ( &dst )[N1][N2], const S ( &src )[M1][M2] )
+    {
+        static_assert( N1 == M1 && N2 == M2 && N1 > 0 && N2 > 0,
+                       "copy_2darray requires equal, non-zero sizes" );
+        for( size_t i = 0; i < N1; ++i )
+            for( size_t j = 0; j < N2; ++j )
+                dst[i][j] = static_cast< T >( src[i][j] );
+    }
+
+}  // namespace
 
 
 // uncomment to get debug messages at info severity
@@ -152,7 +193,10 @@ namespace librealsense
 
     enum temperature_type { TEMPERATURE_TYPE_ASIC, TEMPERATURE_TYPE_MOTION};
 
-    class temperature_option : public readonly_option
+    // Renamed from temperature_option: upstream added a librealsense::temperature_option
+    // in src/ds/d500/d500-options.h, and both landing in the same namespace is a link
+    // error (LNK2005). This one is private to T265, so it takes the qualified name.
+    class tm2_temperature_option : public readonly_option
     {
     public:
         float query() const override { return _ep.get_temperature(_type).fTemperature; }
@@ -161,7 +205,7 @@ namespace librealsense
 
         bool is_enabled() const override { return true; }
 
-        explicit temperature_option(tm2_sensor& ep, temperature_type type) : _ep(ep), _type(type),
+        explicit tm2_temperature_option(tm2_sensor& ep, temperature_type type) : _ep(ep), _type(type),
             _range(option_range{ 0, _ep.get_temperature(_type).fThreshold, 0, 0 }) { }
 
     private:
@@ -256,17 +300,17 @@ namespace librealsense
         const char *description;
     };
 
-    class asic_temperature_option : public temperature_option
+    class asic_temperature_option : public tm2_temperature_option
     {
     public:
         const char* get_description() const override
         {
             return "Current T265 Asic Temperature (degree celsius)";
         }
-        explicit asic_temperature_option(tm2_sensor& ep) :temperature_option(ep, temperature_type::TEMPERATURE_TYPE_ASIC) { }
+        explicit asic_temperature_option(tm2_sensor& ep) :tm2_temperature_option(ep, temperature_type::TEMPERATURE_TYPE_ASIC) { }
     };
 
-    class motion_temperature_option : public temperature_option
+    class motion_temperature_option : public tm2_temperature_option
     {
     public:
 
@@ -274,96 +318,89 @@ namespace librealsense
         {
             return "Current T265 IMU Temperature (degree celsius)";
         }
-        explicit motion_temperature_option(tm2_sensor& ep) :temperature_option(ep, temperature_type::TEMPERATURE_TYPE_MOTION) { }
+        explicit motion_temperature_option(tm2_sensor& ep) :tm2_temperature_option(ep, temperature_type::TEMPERATURE_TYPE_MOTION) { }
     };
 
     class md_tm2_parser : public md_attribute_parser_base
     {
     public:
         md_tm2_parser(rs2_frame_metadata_value type) : _type(type) {}
-        rs2_metadata_type get(const frame& frm) const override
+        // md_attribute_parser_base used to declare get() and supports() separately; it now
+        // has a single find() that reports presence and value together. The two old methods
+        // are merged here. Note they disagreed in the original: supports() omitted pose
+        // frames for TIME_OF_ARRIVAL while get() handled them. The union is used, so pose
+        // frames now report an arrival time instead of silently having none.
+        bool find( const frame & frm, rs2_metadata_type * p_value ) const override
         {
-            if(_type == RS2_FRAME_METADATA_ACTUAL_EXPOSURE)
+            if( _type == RS2_FRAME_METADATA_ACTUAL_EXPOSURE )
             {
-                if (auto* vf = dynamic_cast<const video_frame*>(&frm))
+                if( dynamic_cast< const video_frame * >( &frm ) )
                 {
-                    const video_frame_metadata* md = reinterpret_cast<const video_frame_metadata*>(frm.additional_data.metadata_blob.data());
-                    return (rs2_metadata_type)(md->exposure_time);
+                    auto md = reinterpret_cast< const video_frame_metadata * >(
+                        frm.additional_data.metadata_blob.data() );
+                    if( p_value )
+                        *p_value = (rs2_metadata_type)( md->exposure_time );
+                    return true;
                 }
+                return false;
             }
-            if(_type == RS2_FRAME_METADATA_TIME_OF_ARRIVAL)
-            {
-                // Note: additional_data.system_time is the arrival time
-                // (backend_time is what we have traditionally called
-                // system_time)
-                if (auto* vf = dynamic_cast<const video_frame*>(&frm))
-                {
-                    return (rs2_metadata_type)(vf->additional_data.system_time);
-                }
-                if (auto* mf = dynamic_cast<const motion_frame*>(&frm))
-                {
-                    return (rs2_metadata_type)(mf->additional_data.system_time);
-                }
-                if (auto* pf = dynamic_cast<const pose_frame*>(&frm))
-                {
-                    return (rs2_metadata_type)(pf->additional_data.system_time);
-                }
-            }
-            if(_type == RS2_FRAME_METADATA_FRAME_TIMESTAMP)
-            {
-                if (auto* vf = dynamic_cast<const video_frame*>(&frm))
-                {
-                    return (rs2_metadata_type)(vf->additional_data.timestamp*1e+3);
-                }
-                if (auto* mf = dynamic_cast<const motion_frame*>(&frm))
-                {
-                    return (rs2_metadata_type)(mf->additional_data.timestamp*1e+3);
-                }
-                if (auto* pf = dynamic_cast<const pose_frame*>(&frm))
-                {
-                    return (rs2_metadata_type)(pf->additional_data.timestamp*1e+3);
-                }
-            }
-            if (_type == RS2_FRAME_METADATA_TEMPERATURE)
-            {
-                if (auto* mf = dynamic_cast<const motion_frame*>(&frm))
-                {
-                    const motion_frame_metadata* md = reinterpret_cast<const motion_frame_metadata*>(frm.additional_data.metadata_blob.data());
-                    return (rs2_metadata_type)(md->temperature);
-                }
-            }
-            return 0;
-        }
 
-        bool supports(const frame& frm) const override
-        {
-            if (_type == RS2_FRAME_METADATA_ACTUAL_EXPOSURE)
+            if( _type == RS2_FRAME_METADATA_TEMPERATURE )
             {
-                return dynamic_cast<const video_frame*>(&frm) != nullptr;
+                if( dynamic_cast< const motion_frame * >( &frm ) )
+                {
+                    auto md = reinterpret_cast< const motion_frame_metadata * >(
+                        frm.additional_data.metadata_blob.data() );
+                    if( p_value )
+                        *p_value = (rs2_metadata_type)( md->temperature );
+                    return true;
+                }
+                return false;
             }
-            if (_type == RS2_FRAME_METADATA_TEMPERATURE)
+
+            if( _type == RS2_FRAME_METADATA_TIME_OF_ARRIVAL )
             {
-                return dynamic_cast<const motion_frame*>(&frm) != nullptr;
+                // additional_data.system_time is the arrival time; backend_time is what has
+                // traditionally been called system_time.
+                if( dynamic_cast< const video_frame * >( &frm ) || dynamic_cast< const motion_frame * >( &frm )
+                    || dynamic_cast< const pose_frame * >( &frm ) )
+                {
+                    if( p_value )
+                        *p_value = (rs2_metadata_type)( frm.additional_data.system_time );
+                    return true;
+                }
+                return false;
             }
-            if (_type == RS2_FRAME_METADATA_TIME_OF_ARRIVAL)
+
+            if( _type == RS2_FRAME_METADATA_FRAME_TIMESTAMP )
             {
-                return dynamic_cast<const video_frame*>(&frm) != nullptr || dynamic_cast<const motion_frame*>(&frm) != nullptr;
+                if( dynamic_cast< const video_frame * >( &frm ) || dynamic_cast< const motion_frame * >( &frm )
+                    || dynamic_cast< const pose_frame * >( &frm ) )
+                {
+                    if( p_value )
+                        *p_value = (rs2_metadata_type)( frm.additional_data.timestamp * 1e+3 );
+                    return true;
+                }
+                return false;
             }
-            if (_type == RS2_FRAME_METADATA_FRAME_TIMESTAMP)
-            {
-                return (dynamic_cast<const video_frame*>(&frm) != nullptr) || (dynamic_cast<const motion_frame*>(&frm) != nullptr) || (dynamic_cast<const pose_frame*>(&frm) != nullptr);
-            }
+
             return false;
         }
+
     private:
         rs2_frame_metadata_value _type;
     };
 
     tm2_sensor::tm2_sensor(tm2_device* owner)
-        : sensor_base("Tracking Module", owner, this), _device(owner)
+        : sensor_base("Tracking Module", owner), _device(owner)
     {
         LOG_DEBUG("Making a sensor " << this);
-        _source.set_max_publish_list_size(256); //increase frame source queue size for TM2
+        // frame_source now keys archives by (stream, index, extension) rather than by
+        // extension alone, so this limit applies PER ARCHIVE, not across the sensor. T265
+        // pushes two fisheye streams plus pose and motion through this one sensor, which
+        // used to share a single video archive and no longer does. Kept at the original
+        // value for now; if frames are dropped under load this is the first thing to look at.
+        _source.set_max_publish_list_size(256);
         _data_dispatcher = std::make_shared<dispatcher>(256); // make a queue of the same size to dispatch data messages
         _data_dispatcher->start();
         register_metadata(RS2_FRAME_METADATA_ACTUAL_EXPOSURE, std::make_shared<md_tm2_parser>(RS2_FRAME_METADATA_ACTUAL_EXPOSURE));
@@ -462,7 +499,7 @@ namespace librealsense
                 rs2_stream stream = RS2_STREAM_FISHEYE;
                 rs2_format format = rs2_format_from_tm2(tm_stream.bPixelFormat);
                 platform::stream_profile p = { tm_stream.wWidth, tm_stream.wHeight, tm_stream.wFramesPerSecond, uint32_t(format) };
-                auto profile = std::make_shared<video_stream_profile>(p);
+                auto profile = std::make_shared<video_stream_profile>();
                 profile->set_dims(p.width, p.height);
                 profile->set_stream_type(stream);
                 profile->set_stream_index(sensor_id + 1);  // for nice presentation by the viewer - add 1 to stream index
@@ -496,7 +533,7 @@ namespace librealsense
                     LOG_DEBUG("Skipping accel FPS " << tm_stream.wFramesPerSecond);
                     continue;
                 }
-                auto profile = std::make_shared<motion_stream_profile>(platform::stream_profile{ uint32_t(format), 0, 0, tm_stream.wFramesPerSecond });
+                auto profile = std::make_shared<motion_stream_profile>();
                 profile->set_stream_type(stream);
                 profile->set_stream_index(sensor_id); // for nice presentation by the viewer - add 1 to stream index
                 profile->set_format(format);
@@ -539,7 +576,7 @@ namespace librealsense
         // one differently and it is implicitly always available
         rs2_format format = RS2_FORMAT_6DOF;
         const uint32_t pose_fps = 200;
-        auto profile = std::make_shared<pose_stream_profile>(platform::stream_profile{ uint32_t(format), 0, 0, pose_fps });
+        auto profile = std::make_shared<pose_stream_profile>();
         profile->set_stream_type(RS2_STREAM_POSE);
         profile->set_stream_index(0);
         profile->set_format(format);
@@ -807,7 +844,7 @@ namespace librealsense
         */
     }
 
-    void tm2_sensor::start(frame_callback_ptr callback)
+    void tm2_sensor::start(rs2_frame_callback_sptr callback)
     {
         std::lock_guard<std::mutex> lock(_tm_op_lock);
         LOG_DEBUG("Starting T265");
@@ -834,13 +871,13 @@ namespace librealsense
 
         if (_loopback) {
             auto& loopback_sensor = _loopback->get_sensor(0);
-            auto handle_file_frames = [&](frame_holder fref) {
-                pass_frames_to_fw(std::move(fref));
-            };
-
-            frame_callback_ptr file_frames_callback = { new internal_frame_callback<decltype(handle_file_frames)>(handle_file_frames),
-                [](rs2_frame_callback* p) { p->release(); } };
-            loopback_sensor.start(file_frames_callback);
+            // internal_frame_callback<> was removed; make_frame_callback() is the
+            // replacement. It takes a std::function<void(frame_interface*)>, and a lambda
+            // taking frame_holder still binds because frame_holder has a non-explicit
+            // (non-acquiring) constructor from frame_interface*.
+            auto file_frames_callback = make_frame_callback(
+                [this]( frame_holder fref ) { pass_frames_to_fw( std::move( fref ) ); } );
+            loopback_sensor.start( file_frames_callback );
         }
 
         _is_streaming = true;
@@ -900,7 +937,7 @@ namespace librealsense
         else if(response.intrinsics.dwDistortionModel == 4) result.model = RS2_DISTORTION_KANNALA_BRANDT4;
         else
             throw invalid_value_exception("Invalid distortion model");
-        librealsense::copy_array<true>(result.coeffs, response.intrinsics.flCoeffs);
+        copy_array(result.coeffs, response.intrinsics.flCoeffs);
 
         return result;
     }
@@ -918,9 +955,9 @@ namespace librealsense
         _device->bulk_request_response(request, response);
 
         rs2_motion_device_intrinsic result{};
-        librealsense::copy_2darray<true>(result.data, response.intrinsics.flData);
-        librealsense::copy_array<true>(result.noise_variances, response.intrinsics.flNoiseVariances);
-        librealsense::copy_array<true>(result.bias_variances, response.intrinsics.flBiasVariances);
+        copy_2darray(result.data, response.intrinsics.flData);
+        copy_array(result.noise_variances, response.intrinsics.flNoiseVariances);
+        copy_array(result.bias_variances, response.intrinsics.flBiasVariances);
         return result;
     }
 
@@ -941,8 +978,8 @@ namespace librealsense
         }
 
         rs2_extrinsics result{};
-        librealsense::copy_array<true>(result.rotation, response.extrinsics.flRotation);
-        librealsense::copy_array<true>(result.translation, response.extrinsics.flTranslation);
+        copy_array(result.rotation, response.extrinsics.flRotation);
+        copy_array(result.translation, response.extrinsics.flTranslation);
 
         return result;
     }
@@ -967,7 +1004,7 @@ namespace librealsense
         else if(intr.model == RS2_DISTORTION_KANNALA_BRANDT4) request.intrinsics.dwDistortionModel = 4;
         else
             throw invalid_value_exception("Invalid distortion model");
-        librealsense::copy_array(request.intrinsics.flCoeffs, intr.coeffs);
+        copy_array(request.intrinsics.flCoeffs, intr.coeffs);
 
         bulk_message_response_set_camera_intrinsics response = {};
         _device->bulk_request_response(request, response);
@@ -1027,8 +1064,8 @@ namespace librealsense
 
         bulk_message_request_set_extrinsics request = {{ sizeof(request), DEV_SET_EXTRINSICS }};
         request.bSensorID = SET_SENSOR_ID(sensor_type, sensor_id);
-        librealsense::copy_array<true>(request.extrinsics.flRotation, extr.rotation);
-        librealsense::copy_array<true>(request.extrinsics.flTranslation, extr.translation);
+        copy_array(request.extrinsics.flRotation, extr.rotation);
+        copy_array(request.extrinsics.flTranslation, extr.translation);
         bulk_message_response_set_extrinsics response = {};
 
         _device->bulk_request_response(request, response);
@@ -1047,9 +1084,9 @@ namespace librealsense
 
         bulk_message_request_set_motion_intrinsics request = {{ sizeof(request), DEV_SET_MOTION_INTRINSICS }};
         request.bMotionID = SET_SENSOR_ID(sensor_type, sensor_id);
-        librealsense::copy_2darray<true>(request.intrinsics.flData, intr.data);
-        librealsense::copy_array<true>(request.intrinsics.flNoiseVariances, intr.noise_variances);
-        librealsense::copy_array<true>(request.intrinsics.flBiasVariances, intr.bias_variances);
+        copy_2darray(request.intrinsics.flData, intr.data);
+        copy_array(request.intrinsics.flNoiseVariances, intr.noise_variances);
+        copy_array(request.intrinsics.flBiasVariances, intr.bias_variances);
 
         bulk_message_response_set_motion_intrinsics response = {};
         _device->bulk_request_response(request, response);
@@ -1115,7 +1152,10 @@ namespace librealsense
             return;
         }
 
-        frame_holder frame = _source.alloc_frame(RS2_EXTENSION_POSE_FRAME, sizeof(librealsense::pose_frame::pose_info), additional_data, true);
+        frame_holder frame = _source.alloc_frame( { profile->get_stream_type(), profile->get_stream_index(), RS2_EXTENSION_POSE_FRAME },
+                                                  sizeof( librealsense::pose_frame::pose_info ),
+                                                  std::move( additional_data ),
+                                                  true );
         if (frame.frame)
         {
             auto pose_frame = static_cast<librealsense::pose_frame*>(frame.frame);
@@ -1227,7 +1267,10 @@ namespace librealsense
         last_ts = ts;
 
         //TODO - extension_type param assumes not depth
-        frame_holder frame = _source.alloc_frame(RS2_EXTENSION_VIDEO_FRAME, height * stride, additional_data, true);
+        frame_holder frame = _source.alloc_frame( { profile->get_stream_type(), profile->get_stream_index(), RS2_EXTENSION_VIDEO_FRAME },
+                                                  height * stride,
+                                                  std::move( additional_data ),
+                                                  true );
         if (frame.frame)
         {
             auto video = (video_frame*)(frame.frame);
@@ -1252,7 +1295,7 @@ namespace librealsense
         auto ts_nanos = duration<uint64_t, std::nano>(device_ns);
         result.device_ts = duration<double, std::milli>(ts_nanos);
         result.global_ts = duration<double, std::milli>(ts_nanos + duration<int64_t, std::nano>(device_to_host_ns));
-        result.arrival_ts = duration<double, std::milli>(environment::get_instance().get_time_service()->get_time());
+        result.arrival_ts = duration<double, std::milli>(time_service::get_time());
         return result;
     }
 
@@ -1452,13 +1495,13 @@ namespace librealsense
             bulk_message_request_get_time request = {{ sizeof(request), DEV_GET_TIME }};
             bulk_message_response_get_time response = {};
 
-            auto start = duration<double, std::milli>(environment::get_instance().get_time_service()->get_time());
+            auto start = duration<double, std::milli>(time_service::get_time());
             platform::usb_status usb_response = _device->bulk_request_response(request, response);
             if(usb_response != platform::RS2_USB_STATUS_SUCCESS) {
                 LOG_INFO("Got bad response, stopping time sync");
                 break;
             }
-            auto finish = duration<double, std::milli>(environment::get_instance().get_time_service()->get_time());
+            auto finish = duration<double, std::milli>(time_service::get_time());
             auto usb_delay = (finish - start) / 2;
 
             //If usb response takes too long, skip update. 0.25ms is 5% of 200Hz
@@ -1531,7 +1574,10 @@ namespace librealsense
             return;
         }
 
-        frame_holder frame = _source.alloc_frame(RS2_EXTENSION_MOTION_FRAME, 3 * sizeof(float), additional_data, true);
+        frame_holder frame = _source.alloc_frame( { profile->get_stream_type(), profile->get_stream_index(), RS2_EXTENSION_MOTION_FRAME },
+                                                  3 * sizeof( float ),
+                                                  std::move( additional_data ),
+                                                  true );
         if (frame.frame)
         {
             auto motion_frame = static_cast<librealsense::motion_frame*>(frame.frame);
@@ -1561,7 +1607,7 @@ namespace librealsense
     void tm2_sensor::raise_error_notification(const std::string& msg)
     {
         notification error{ RS2_NOTIFICATION_CATEGORY_HARDWARE_ERROR, 0, RS2_LOG_SEVERITY_ERROR, msg };
-        error.timestamp = duration<double, std::milli>(environment::get_instance().get_time_service()->get_time()).count();
+        error.timestamp = duration<double, std::milli>(time_service::get_time()).count();
         get_notifications_processor()->raise_notification(error);
     }
 
@@ -1916,10 +1962,14 @@ namespace librealsense
     ///////////////
     // Device
 
-    tm2_device::tm2_device( std::shared_ptr<context> ctx, const platform::backend_device_group& group, bool register_device_notifications) :
-        device(ctx, group, register_device_notifications)
+    tm2_device::tm2_device( std::shared_ptr< const tm2_info > const & dev_info ) :
+        device( dev_info )
     {
-        if(group.usb_devices.size() != 1 || group.uvc_devices.size() != 0 || group.hid_devices.size() !=0)
+        auto const & group = dev_info->get_group();
+        // The mipi list did not exist when this check was written; a T265 is a single USB
+        // node and nothing else, on any transport.
+        if( group.usb_devices.size() != 1 || ! group.uvc_devices.empty()
+            || ! group.hid_devices.empty() || ! group.mipi_devices.empty() )
             throw io_exception("Tried to create a T265 with a bad backend_device_group");
 
         LOG_DEBUG("Creating a T265 device");
@@ -1978,7 +2028,15 @@ namespace librealsense
         std::string firmware = rsutils::string::from() << std::to_string(info_response.message.bFWVersionMajor) << "." << std::to_string(info_response.message.bFWVersionMinor) << "." << std::to_string(info_response.message.bFWVersionPatch) << "." << std::to_string(info_response.message.dwFWVersionBuild);
         register_info(RS2_CAMERA_INFO_FIRMWARE_VERSION, firmware);
         LOG_INFO("Firmware version: " << firmware);
-        register_info(RS2_CAMERA_INFO_PRODUCT_ID, hexify(usb_info.pid));
+        {
+            // librealsense::hexify() was removed from types.h; reproduce its formatting
+            // (zero-padded, uppercase, two characters per byte) so the reported product ID
+            // string is unchanged from what applications used to see.
+            std::ostringstream oss;
+            oss << std::setw( sizeof( usb_info.pid ) * 2 ) << std::setfill( '0' ) << std::uppercase
+                << std::hex << usb_info.pid;
+            register_info( RS2_CAMERA_INFO_PRODUCT_ID, oss.str() );
+        }
         register_info(RS2_CAMERA_INFO_PRODUCT_LINE, "T200");
 
         register_info(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR, platform::usb_spec_names.at(usb_info.conn_spec));
@@ -2130,7 +2188,8 @@ namespace librealsense
         std::shared_ptr<playback_device> raw_streams;
         try
         {
-            raw_streams = std::make_shared<playback_device>(ctx, std::make_shared<ros_reader>(source_file, ctx));
+            raw_streams = std::make_shared<playback_device>( std::make_shared<playback_device_info>( ctx, source_file ),
+                                                             std::make_shared<ros_reader>( source_file, ctx ) );
         }
         catch (const std::exception& e)
         {

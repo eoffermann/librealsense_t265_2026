@@ -17,4 +17,8 @@ target_sources(${LRS_TARGET}
         "${CMAKE_CURRENT_LIST_DIR}/tm-info.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/tm-boot.h"
         "${CMAKE_CURRENT_LIST_DIR}/tm-boot.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/tm-device.h"
+        "${CMAKE_CURRENT_LIST_DIR}/tm-device.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/t265-messages.h"
+        "${CMAKE_CURRENT_LIST_DIR}/message-print.h"
 )

@@ -2,9 +2,9 @@
 // Copyright(c) 2017-2026 RealSense, Inc. All Rights Reserved.
 
 #include "tm-info.h"
+#include "tm-device.h"
 
 #include <src/context.h>
-#include <src/librealsense-exception.h>
 #include <src/platform/platform-utils.h>
 
 #include <rsutils/easylogging/easyloggingpp.h>
@@ -18,12 +18,8 @@ namespace librealsense
 
     std::shared_ptr< device_interface > tm2_info::create_device()
     {
-        // Phase 3 replaces this with construction of the tm2_device, once tm-device.cpp has
-        // been ported onto the current device / backend_device base classes. Until then the
-        // device enumerates and can be listed, but cannot be opened -- and says so, rather
-        // than failing in some less obvious way further down.
-        throw not_implemented_exception(
-            "T265 support is still being ported: the device enumerates but cannot yet be opened" );
+        return std::make_shared< tm2_device >(
+            std::dynamic_pointer_cast< const tm2_info >( shared_from_this() ) );
     }
 
 

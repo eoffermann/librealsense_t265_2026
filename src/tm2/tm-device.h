@@ -18,13 +18,14 @@
 namespace librealsense
 {
     class tm2_sensor;
+    class tm2_info;
 
     class tm2_device : public virtual device, public tm2_extensions
     {
     public:
-        tm2_device(std::shared_ptr<context> ctx,
-            const platform::backend_device_group& group,
-            bool register_device_notifications);
+        // The device now takes its device_info rather than a (ctx, group, notifications)
+        // triple; the context and the backend_device_group both hang off it.
+        explicit tm2_device( std::shared_ptr< const tm2_info > const & dev_info );
 
         virtual ~tm2_device();
 
@@ -88,9 +89,13 @@ namespace librealsense
         // sensor interface
         ////////////////////
         stream_profiles init_stream_profiles() override;
+        // get_raw_stream_profiles() is a newer pure virtual on sensor_interface that
+        // sensor_base does not implement. T265 feeds itself from a USB message loop rather
+        // than from a raw sensor, so the initialized profiles are the raw profiles.
+        stream_profiles const & get_raw_stream_profiles() const override { return initialized_profiles(); }
         void open(const stream_profiles& requests) override;
         void close() override;
-        void start(frame_callback_ptr callback) override;
+        void start(rs2_frame_callback_sptr callback) override;
         void stop() override;
         rs2_intrinsics get_intrinsics(const stream_profile& profile) const override;
         rs2_motion_device_intrinsic get_motion_intrinsics(const motion_stream_profile_interface& profile) const;
@@ -131,11 +136,9 @@ namespace librealsense
         // Async operations handler
         async_op_state perform_async_transfer(std::function<bool()> transfer_activator,
             std::function<void()> on_success, const std::string& op_description) const;
-        // Recording interfaces
-        virtual void create_snapshot(std::shared_ptr<pose_sensor_interface>& snapshot) const override {}
-        virtual void enable_recording(std::function<void(const pose_sensor_interface&)> record_action) override {}
-        virtual void create_snapshot(std::shared_ptr<wheel_odometry_interface>& snapshot) const override {}
-        virtual void enable_recording(std::function<void(const wheel_odometry_interface&)> record_action) override {}
+        // The create_snapshot/enable_recording overrides that used to live here are gone:
+        // pose_sensor_interface and wheel_odometry_interface are no longer recordable<>,
+        // so there is nothing left to override.
 
         //calibration write interface
         static const uint16_t ID_OEM_CAL = 6;
