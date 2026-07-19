@@ -22,8 +22,6 @@ namespace librealsense
 {
     namespace ivcam2
     {
-        const int ac_depth_results::table_id;
-        const uint16_t ac_depth_results::this_version;
         
         const uint16_t rgb_calibration_table::table_id;
         const uint16_t rgb_calibration_table::eeprom_table_id;

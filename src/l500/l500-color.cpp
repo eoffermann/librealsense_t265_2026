@@ -52,11 +52,11 @@ namespace librealsense
 
     std::shared_ptr<synthetic_sensor> l500_color::create_color_device(std::shared_ptr<context> ctx, const std::vector<platform::uvc_device_info>& color_devices_info)
     {
-        auto&& backend = ctx->get_backend();
+        auto&& backend = get_backend();
 
-        std::unique_ptr<frame_timestamp_reader> timestamp_reader_metadata(new ivcam2::l500_timestamp_reader_from_metadata(backend.create_time_service()));
+        std::unique_ptr<frame_timestamp_reader> timestamp_reader_metadata(new ivcam2::l500_timestamp_reader_from_metadata());
         auto enable_global_time_option = std::shared_ptr<global_time_option>(new global_time_option());
-        auto raw_color_ep = std::make_shared<uvc_sensor>("RGB Camera", ctx->get_backend().create_uvc_device(color_devices_info.front()),
+        auto raw_color_ep = std::make_shared<uvc_sensor>("RGB Camera", get_backend().create_uvc_device(color_devices_info.front()),
             std::unique_ptr<frame_timestamp_reader>(new global_timestamp_reader(std::move(timestamp_reader_metadata), _tf_keeper, enable_global_time_option)),
             this);
         auto color_ep = std::make_shared<l500_color_sensor>(this, raw_color_ep, ctx, l500_color_fourcc_to_rs2_format, l500_color_fourcc_to_rs2_stream);
@@ -520,7 +520,7 @@ namespace librealsense
         // Set a new memory allocated intrinsics struct (Full size 5 resolutions)
         // Copy the relevant data from the dynamic resolution received from the FW
         ivcam2::intrinsic_rgb  resolutions_rgb_table_output;
-        librealsense::copy(&resolutions_rgb_table_output, resolutions_rgb_table_ptr, expected_size);
+        memcpy(&resolutions_rgb_table_output, resolutions_rgb_table_ptr, expected_size);
 
         return resolutions_rgb_table_output;
     }

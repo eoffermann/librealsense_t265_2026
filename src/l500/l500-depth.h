@@ -114,7 +114,7 @@ namespace librealsense
         std::vector<rs2_option> get_supported_options() const override
         {
             std::vector<rs2_option> options;
-            for (auto opt : _options)
+            for (auto opt : _options_by_id)
             {
                 if (std::find_if(_owner->_advanced_options.begin(), _owner->_advanced_options.end(), [opt](rs2_option o) { return o == opt.first;}) != _owner->_advanced_options.end())
                     continue;
@@ -224,16 +224,8 @@ namespace librealsense
 
         stream_profiles get_debug_stream_profiles() const override;
 
-        void create_snapshot(std::shared_ptr<depth_sensor>& snapshot) const override
-        {
-            snapshot = std::make_shared<depth_sensor_snapshot>(get_depth_scale());
-        }
-        void enable_recording(std::function<void(const depth_sensor&)> recording_function) override
-        {
-            get_option(RS2_OPTION_DEPTH_UNITS).enable_recording([this, recording_function](const option& o) {
-                recording_function(*this);
-            });
-        }
+        // depth_sensor / color_sensor / debug_interface are no longer recordable<>,
+        // so these overrides have nothing left to override.
 
         void create_snapshot(std::shared_ptr<l500_depth_sensor_interface>& snapshot) const  override
         {

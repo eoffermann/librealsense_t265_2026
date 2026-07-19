@@ -6,6 +6,9 @@
 #include <src/firmware-version.h>
 
 #include <src/hw-monitor.h>
+#include <src/float3.h>
+#include <src/core/time-service.h>
+#include <src/frame.h>
 
 #include "../backend.h"
 #include "../types.h"
@@ -193,16 +196,9 @@ namespace librealsense
         }
 
 #pragma pack(push, 1)
-        struct ac_depth_results  // aka "Algo_AutoCalibration" in FW
-        {
-            static const int table_id = 0x240;
-            static const uint16_t this_version = (RS2_API_MAJOR_VERSION << 12 | RS2_API_MINOR_VERSION << 4 | RS2_API_PATCH_VERSION);
-
-            rs2_dsm_params params;
-
-            ac_depth_results() {}
-            ac_depth_results( rs2_dsm_params const & dsm_params ) : params( dsm_params ) {}
-        };
+        // struct ac_depth_results removed: it stored an rs2_dsm_params, and that type was
+        // deleted from the public API in Nov 2023 along with the depth-to-RGB
+        // auto-calibration subsystem, which is not part of this restoration.
 
         struct rgb_calibration_table
         {
@@ -483,11 +479,11 @@ namespace librealsense
         {
             static const int pins = 3;
             mutable std::vector<size_t> counter;
-            std::shared_ptr<platform::time_service> _ts;
             mutable std::recursive_mutex _mtx;
         public:
-            l500_timestamp_reader(std::shared_ptr<platform::time_service> ts)
-                : counter(pins), _ts(ts)
+            // time_service used to be injected as a shared_ptr; it is now a static utility.
+            l500_timestamp_reader()
+                : counter(pins)
             {
                 reset();
             }
@@ -504,7 +500,7 @@ namespace librealsense
             rs2_time_t get_frame_timestamp(const std::shared_ptr<frame_interface>&) override
             {
                 std::lock_guard<std::recursive_mutex> lock(_mtx);
-                return _ts->get_time();
+                return time_service::get_time();
             }
 
             unsigned long long get_frame_counter(const std::shared_ptr<frame_interface>& frame) const override
@@ -557,9 +553,9 @@ namespace librealsense
             }
 
         public:
-            l500_timestamp_reader_from_metadata(std::shared_ptr<platform::time_service> ts) :_backup_timestamp_reader(nullptr), one_time_note(false)
+            l500_timestamp_reader_from_metadata() :_backup_timestamp_reader(nullptr), one_time_note(false)
             {
-                _backup_timestamp_reader = std::unique_ptr<l500_timestamp_reader>(new l500_timestamp_reader(ts));
+                _backup_timestamp_reader = std::unique_ptr<l500_timestamp_reader>(new l500_timestamp_reader());
                 reset();
             }
 

@@ -66,7 +66,7 @@ namespace librealsense
 
         using namespace ivcam2;
 
-        auto&& backend = ctx->get_backend();
+        auto&& backend = get_backend();
 
         auto& depth_sensor = get_depth_sensor();
         auto& raw_depth_sensor = get_raw_depth_sensor();
@@ -154,13 +154,13 @@ namespace librealsense
     std::shared_ptr<synthetic_sensor> l500_device::create_depth_device( std::shared_ptr<context> ctx,
         const std::vector<platform::uvc_device_info>& all_device_infos )
     {
-        auto&& backend = ctx->get_backend();
+        auto&& backend = get_backend();
 
         std::vector<std::shared_ptr<platform::uvc_device>> depth_devices;
         for( auto&& info : filter_by_mi( all_device_infos, 0 ) ) // Filter just mi=0, DEPTH
             depth_devices.push_back( backend.create_uvc_device( info ) );
 
-        std::unique_ptr<frame_timestamp_reader> timestamp_reader_metadata( new l500_timestamp_reader_from_metadata( backend.create_time_service() ) );
+        std::unique_ptr<frame_timestamp_reader> timestamp_reader_metadata( new l500_timestamp_reader_from_metadata() );
         auto enable_global_time_option = std::shared_ptr<global_time_option>( new global_time_option() );
         auto raw_depth_ep = std::make_shared<uvc_sensor>( "Raw Depth Sensor", std::make_shared<platform::multi_pins_uvc_device>( depth_devices ),
             std::unique_ptr<frame_timestamp_reader>( new global_timestamp_reader( std::move( timestamp_reader_metadata ), _tf_keeper, enable_global_time_option ) ), this );
@@ -304,16 +304,6 @@ namespace librealsense
         command cmd(ivcam2::fw_cmd::HW_RESET);
         cmd.require_response = false;
         _hw_monitor->send(cmd);
-    }
-
-    void l500_device::create_snapshot(std::shared_ptr<debug_interface>& snapshot) const
-    {
-        throw not_implemented_exception("create_snapshot(...) not implemented!");
-    }
-
-    void l500_device::enable_recording(std::function<void(const debug_interface&)> record_action)
-    {
-        throw not_implemented_exception("enable_recording(...) not implemented!");
     }
 
     double l500_device::get_device_time_ms()

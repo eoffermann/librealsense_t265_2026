@@ -41,7 +41,7 @@ namespace librealsense
         typedef uvc_xu_option< int > super;
 
     public:
-        digital_gain_option( uvc_sensor & ep,
+        digital_gain_option( const std::weak_ptr< uvc_sensor > & ep,
                              platform::extension_unit xu,
                              uint8_t id,
                              std::string description,

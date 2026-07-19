@@ -7,6 +7,7 @@
 
 // Types below moved out of the headers that used to provide them transitively.
 #include <src/core/debug.h>
+#include <src/core/notification.h>
 #include <src/platform/backend-device-group.h>
 
 #include <vector>
@@ -67,8 +68,8 @@ namespace librealsense
             force_hardware_reset();
         }
 
-        void create_snapshot(std::shared_ptr<debug_interface>& snapshot) const override;
-        void enable_recording(std::function<void(const debug_interface&)> record_action) override;
+        // depth_sensor / color_sensor / debug_interface are no longer recordable<>,
+        // so these overrides have nothing left to override.
         double get_device_time_ms() override;
 
         void enter_update_state() const override;

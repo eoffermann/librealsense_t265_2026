@@ -61,7 +61,7 @@ namespace librealsense
         // Set a new memory allocated intrinsics struct (Full size 5 resolutions)
         // Copy the relevant data from the dynamic resolution received from the FW
         ivcam2::intrinsic_depth  resolutions_depth_table_output;
-        librealsense::copy(&resolutions_depth_table_output, resolutions_depth_table_ptr, expected_size);
+        memcpy(&resolutions_depth_table_output, resolutions_depth_table_ptr, expected_size);
       
         return resolutions_depth_table_output;
     }

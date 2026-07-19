@@ -83,32 +83,34 @@ namespace librealsense
         std::shared_ptr<matcher> create_matcher(const frame_holder& frame) const override;
     };
 
-    std::shared_ptr<device_interface> l500_info::create(std::shared_ptr<context> ctx,
-        bool register_device_notifications) const
+    std::shared_ptr<device_interface> l500_info::create_device()
     {
-        if (_depth.size() == 0) throw std::runtime_error("Depth Camera not found!");
-        auto pid = _depth.front().pid;
-        platform::backend_device_group group{ get_device_data() };
+        auto const & group = get_group();
+        if (group.uvc_devices.empty()) throw std::runtime_error("Depth Camera not found!");
+        auto pid = group.uvc_devices.front().pid;
+
+        auto dev_info = std::dynamic_pointer_cast< const l500_info >( shared_from_this() );
+        bool const register_device_notifications = true;
 
         switch (pid)
         {
         case L500_PID:
-            return std::make_shared<rs500_device>(ctx, group, register_device_notifications);
+            return std::make_shared<rs500_device>(dev_info, register_device_notifications);
         case L515_PID_PRE_PRQ:
         case L515_PID:
-            return std::make_shared<l515_device>(ctx, group, register_device_notifications);
+            return std::make_shared<l515_device>(dev_info, register_device_notifications);
        default:
             throw std::runtime_error( rsutils::string::from() << "Unsupported L500 model! 0x" << std::hex
                                                               << std::setw( 4 ) << std::setfill( '0' ) << (int)pid );
         }
     }
 
-    std::vector<std::shared_ptr<device_info>> l500_info::pick_l500_devices(
+    std::vector<std::shared_ptr<l500_info>> l500_info::pick_l500_devices(
         std::shared_ptr<context> ctx,
         platform::backend_device_group& group)
     {
         std::vector<platform::uvc_device_info> chosen;
-        std::vector<std::shared_ptr<device_info>> results;
+        std::vector<std::shared_ptr<l500_info>> results;
 
         auto correct_pid = filter_by_product(group.uvc_devices, { L500_PID, L515_PID, L515_PID_PRE_PRQ });
         auto group_devices = group_devices_and_hids_by_unique_id(group_devices_by_unique_id(correct_pid), group.hid_devices);
@@ -117,9 +119,12 @@ namespace librealsense
             if (!g.first.empty() && mi_present(g.first, 0))
             {
                 auto depth = get_mi(g.first, 0);
+                // The group now holds a vector of hardware-monitor nodes rather than one.
                 platform::usb_device_info hwm;
-
-                if (!ivcam2::try_fetch_usb_device(group.usb_devices, depth, hwm))
+                std::vector<platform::usb_device_info> hwm_devices;
+                if (ivcam2::try_fetch_usb_device(group.usb_devices, depth, hwm))
+                    hwm_devices.push_back(hwm);
+                else
                     LOG_DEBUG("try_fetch_usb_device(...) failed.");
 
                 if(g.first[0].pid != L500_PID)
@@ -131,7 +136,7 @@ namespace librealsense
 #endif // Not supported by android & macos
                     }
 
-                auto info = std::make_shared<l500_info>(ctx, g.first, hwm, g.second);
+                auto info = std::make_shared<l500_info>(ctx, std::move(g.first), std::move(hwm_devices), std::move(g.second));
                 chosen.push_back(depth);
                 results.push_back(info);
             }
