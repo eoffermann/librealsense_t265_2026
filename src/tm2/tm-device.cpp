@@ -589,16 +589,34 @@ namespace librealsense
         results.push_back(profile);
         profile_map[SET_SENSOR_ID(SensorType::Pose, 0)] = profile;
 
-        // Add a synthesised depth stream, computed on the host from the fisheye pair.
-        // Like pose this is not a raw stream the device can be asked for. It is only
-        // offered when the device actually has two fisheye cameras to work with.
+        //add extrinsic parameters
+        for (auto profile : results)
         {
-            int fisheye_count = 0;
-            for( auto const & raw : _supported_raw_streams )
-                if( GET_SENSOR_TYPE( raw.bSensorID ) == SensorType::Fisheye )
-                    ++fisheye_count;
+            auto current_extrinsics = get_extrinsics(*profile, 0); // TODO remove 0
+            environment::get_instance().get_extrinsics_graph().register_extrinsics(*profile, *reference_profile, current_extrinsics);
+        }
 
-            if( fisheye_count >= 2 )
+        // Add a synthesised depth stream, computed on the host from the fisheye pair.
+        // Like pose this is not a raw stream the device can be asked for; it is offered only
+        // when the device actually has two fisheye cameras to work with.
+        //
+        // This has to come after the extrinsics loop above. That loop asks the device for the
+        // extrinsics of every profile it sees, and the device only knows about its own
+        // sensors -- handing it a synthesised depth profile makes it reject the request and
+        // fail enumeration outright. Depth extrinsics are registered explicitly below instead.
+        {
+            std::shared_ptr< stream_profile_interface > left_fisheye;
+            int fisheye_count = 0;
+            for( auto const & prof : results )
+            {
+                if( prof->get_stream_type() != RS2_STREAM_FISHEYE )
+                    continue;
+                ++fisheye_count;
+                if( prof->get_stream_index() == 1 )
+                    left_fisheye = prof;
+            }
+
+            if( fisheye_count >= 2 && left_fisheye )
             {
                 auto depth = std::make_shared< video_stream_profile >();
                 depth->set_stream_type( RS2_STREAM_DEPTH );
@@ -617,16 +635,17 @@ namespace librealsense
                 depth->set_intrinsics( [intr]() { return intr; } );
 
                 depth->tag_profile( profile_tag::PROFILE_TAG_SUPERSET );
+
+                // build_remap() gives the left camera an identity rotation, so the rectified
+                // frame the depth map lives in is the left fisheye frame. Declaring them
+                // coincident is exact, and avoids asking the device about a sensor it has not
+                // got.
+                environment::get_instance().get_extrinsics_graph().register_same_extrinsics(
+                    *depth, *left_fisheye );
+
                 results.push_back( depth );
                 _depth_profile = depth;
             }
-        }
-
-        //add extrinsic parameters
-        for (auto profile : results)
-        {
-            auto current_extrinsics = get_extrinsics(*profile, 0); // TODO remove 0
-            environment::get_instance().get_extrinsics_graph().register_extrinsics(*profile, *reference_profile, current_extrinsics);
         }
 
         auto accel_it = std::find_if(results.begin(), results.end(),
@@ -660,6 +679,8 @@ namespace librealsense
             loopback_sensor.open(loopback_sensor.get_stream_profiles());
         }
 
+        _fisheye_requested[0] = _fisheye_requested[1] = false;
+
         _active_raw_streams.clear();
         for(auto p : _supported_raw_streams) {
             p.bOutputMode = 0; // disable output
@@ -670,25 +691,30 @@ namespace librealsense
             auto sp = to_profile(r.get());
             int stream_index = sp.index;
             rs2_stream stream_type = r->get_stream_type();
+            LOG_INFO("Request for stream type " << r->get_stream_type() << " with stream index " << stream_index);
+
+            // Depth is synthesised on the host from the fisheye pair, so it has to be taken
+            // out before tm2_sensor_type() sees it -- that call throws for any stream the
+            // device does not physically have. Both fisheye raw streams are switched on
+            // below whether or not the caller asked for them; an explicit fisheye request
+            // still wins on format and rate because it is processed here first.
+            if(stream_type == RS2_STREAM_DEPTH) {
+                LOG_DEBUG("Host-side stereo depth enabled");
+                _depth_output_enabled = true;
+                continue;
+            }
+
             int tm_sensor_type = tm2_sensor_type(stream_type);
             int tm_sensor_id   = tm2_sensor_id(stream_type, stream_index);
-            LOG_INFO("Request for stream type " << r->get_stream_type() << " with stream index " << stream_index);
+
+            if(stream_type == RS2_STREAM_FISHEYE && tm_sensor_id >= 0 && tm_sensor_id < 2)
+                _fisheye_requested[tm_sensor_id] = true;
 
             if(stream_type == RS2_STREAM_POSE) {
                 if(stream_index != 0)
                     throw invalid_value_exception("Invalid profile configuration - pose stream only supports index 0");
                 LOG_DEBUG("Pose output enabled");
                 _pose_output_enabled = true;
-                continue;
-            }
-
-            if(stream_type == RS2_STREAM_DEPTH) {
-                // Depth is derived from the fisheye pair, so both fisheye raw streams have
-                // to be switched on whether or not the caller asked for them. They are
-                // enabled below, after the requested streams have been processed, so an
-                // explicit fisheye request still takes precedence for format and rate.
-                LOG_DEBUG("Host-side stereo depth enabled");
-                _depth_output_enabled = true;
                 continue;
             }
 
@@ -1317,12 +1343,20 @@ namespace librealsense
         // Feed the stereo depth worker. Dimensions come from the profile rather than the
         // message, which carries only the payload length. Sensor index is 0/1 on the wire;
         // librealsense presents the same cameras as fisheye 1 and 2.
+        auto const fe_index = GET_SENSOR_INDEX( message->rawStreamHeader.bSensorID );
+
         if( _depth_output_enabled )
-            submit_fisheye_for_depth( GET_SENSOR_INDEX( message->rawStreamHeader.bSensorID ),
+            submit_fisheye_for_depth( fe_index,
                                       message->metadata.bFrameData,
                                       width, height,
                                       ts.global_ts.count(),
                                       message->rawStreamHeader.dwFrameId );
+
+        // Depth needs both cameras running, so a caller who asked only for depth still gets
+        // fisheye frames arriving here. Publishing them would put streams in the viewer that
+        // nobody enabled, so they stop at the matcher.
+        if( fe_index < 2 && ! _fisheye_requested[fe_index] )
+            return;
 
         //Global base time sync may happen between two frames
         //Make sure 2nd frame global timestamp is not impacted.
@@ -2126,6 +2160,12 @@ namespace librealsense
         _sensor->register_option(rs2_option::RS2_OPTION_ASIC_TEMPERATURE, std::make_shared<asic_temperature_option>(*_sensor));
         _sensor->register_option(rs2_option::RS2_OPTION_MOTION_MODULE_TEMPERATURE, std::make_shared<motion_temperature_option>(*_sensor));
 
+        // The viewer reads this to turn Z16 samples into metres. It is fixed, because the
+        // host-side stereo matcher writes millimetres by construction.
+        _sensor->register_option(rs2_option::RS2_OPTION_DEPTH_UNITS,
+            std::make_shared<const_value_option>("Number of meters represented by a single depth unit",
+                tm2_sensor::DEPTH_UNITS));
+
         _sensor->register_option(rs2_option::RS2_OPTION_EXPOSURE, std::make_shared<exposure_option>(*_sensor));
         _sensor->register_option(rs2_option::RS2_OPTION_GAIN, std::make_shared<gain_option>(*_sensor));
         _sensor->register_option(rs2_option::RS2_OPTION_ENABLE_AUTO_EXPOSURE, std::make_shared<exposure_mode_option>(*_sensor));
@@ -2440,7 +2480,7 @@ namespace librealsense
         int const W = _stereo_cfg.width_px(), H = _stereo_cfg.height_px;
         int const roi_w = W - _stereo_cfg.max_disparity;
         float const focal = _stereo_cfg.focal_px();
-        float const depth_units = 0.001f;
+        float const depth_units = DEPTH_UNITS;
 
         std::vector< uint8_t >  left( size_t( W ) * H ), right( size_t( W ) * H );
         std::vector< float >    disparity( size_t( W ) * H );
