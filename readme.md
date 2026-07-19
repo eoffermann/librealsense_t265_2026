@@ -1,7 +1,7 @@
 > [!IMPORTANT]
 > ## Deprecated-camera preservation fork of librealsense
 >
-> This is a fork of [realsenseai/librealsense](https://github.com/realsenseai/librealsense) with one purpose: **keep discontinued Intel RealSense cameras working on a current SDK.**
+> This is a fork of [realsenseai/librealsense](https://github.com/realsenseai/librealsense) with one purpose: **keep discontinued Intel RealSense cameras working on a current SDK** — and, where the hardware allows, do more with them than they originally shipped with.
 >
 > Upstream has removed several product lines over time. The usual way to keep such a camera running is to pin to the last release that supported it and forgo years of SDK improvements. This fork takes the other approach: restore the driver and **forward-port it onto current upstream code**, then keep merging upstream as it evolves.
 >
@@ -9,22 +9,53 @@
 >
 > | Camera | Removed upstream | Status here |
 > |---|---|---|
-> | **T265 / TM2** (tracking) | Jan 2023, after `v2.53.1` ([PR #11287](https://github.com/realsenseai/librealsense/pull/11287)) | ✅ **Working** |
-> | **L515 / L500** (LiDAR depth) | Jul 2023 | 🚧 **In progress** |
+> | **T265 / TM2** (tracking) | Jan 2023, after `v2.53.1` ([PR #11287](https://github.com/realsenseai/librealsense/pull/11287)) | ✅ **Working** — plus depth & point clouds it never shipped with |
+> | **L515 / L500** (LiDAR depth) | Jul 2023 | ✅ **Working** |
 >
-> #### T265 — working
+> Both are verified on real hardware, not merely compiled.
 >
-> Verified on hardware: the camera is sent its firmware, boots, enumerates, and streams **6DOF pose, both fisheye channels, gyro and accel** concurrently. Both the 2D and 3D views work in `realsense-viewer`, including live pose readout and trajectory rendering.
+> ---
 >
-> Not yet verified: **record/playback round-trip** through a rosbag, and any long-duration soak testing. ros2 bag pose support is also still absent. Treat those as unproven rather than broken.
+> ### T265 — restored, and extended with depth
+>
+> **Restored.** The camera is sent its firmware, boots, enumerates, and streams **6DOF pose, both fisheye channels, gyro and accel** concurrently. Both the 2D and 3D views work in `realsense-viewer`, including live pose readout and trajectory rendering.
+>
+> **New here: depth and point clouds.** The T265 has no depth hardware and never exposed a depth stream. But its two fisheye cameras are a calibrated stereo pair, so depth can be computed on the host — and this fork exposes it as a genuine `RS2_STREAM_DEPTH` on the device. It shows up in the viewer, colourises in 2D, reconstructs in 3D, and works through the ordinary librealsense API (`rs2::pointcloud` and the rest) with no T265-specific code in your application.
+>
+> Both fisheye images are rectified into a common ideal-pinhole frame using the factory Kannala-Brandt calibration, matched with a census transform and semi-global matching (8-path aggregation), then emitted as Z16 millimetres.
+>
+> **Performance is limited, and that is the deliberate trade.** It all runs on the CPU — there is no depth ASIC and no AI accelerator to lean on:
+>
+> | | |
+> |---|---|
+> | Resolution | 300 x 300, Z16 (1 mm units) |
+> | Field of view | 90° centre crop — **not** the full fisheye FOV |
+> | Frame rate | ~3 fps (~317 ms per frame) |
+> | Coverage | ~79% of pixels valid on typical indoor scenes |
+> | Range | 0.15 – 8 m |
+>
+> Matching happens on a worker thread that always takes the newest complete fisheye pair and discards whatever arrived while it was busy, so it never stalls the USB message loop: pose and fisheye keep their full 200 Hz and 30 fps while depth updates more slowly underneath them. Enabling depth switches both fisheye cameras on internally; frames you did not ask for are consumed by the matcher rather than published.
+>
+> Accuracy was checked against a measured scene (~1.21 m reported against ~1.2 m actual), and rectification against an epipolar test (77% of matched features within ±1 row).
+>
+> If it is too slow or too sparse for your purposes, the trade-offs live in `matcher_config` in [`src/proc/t265-stereo-match.h`](src/proc/t265-stereo-match.h). `sgm_paths` (8 → 4) and `max_disparity` buy speed at the cost of quality and range; `uniqueness` and `min_variance` trade coverage against false matches.
 >
 > Build with `-DBUILD_WITH_TM2=ON`. The firmware image is downloaded and hash-verified at configure time; `RS2_T265_FW_PATH` overrides its location if needed.
 >
-> #### L515 — not yet
+> ### L515 — restored
 >
-> Work has started on restoring L500 support. **An L515 will not enumerate in this fork today.** If you need one working now, use the last upstream release that supported it.
+> Enumerates and streams **depth, IR, confidence, colour and IMU** with real data, verified in `realsense-viewer` (0.49 – 8.2 m observed across test scenes).
 >
-> #### Any other RealSense camera
+> ### Known gaps
+>
+> Treat these as unproven rather than broken:
+>
+> - **Record/playback round-trip** through a rosbag, on either camera, including the new depth stream
+> - **Long-duration soak testing** on either camera
+> - **ros2 bag pose support** is still absent
+> - The **V4L2 firmware-boot hook** for the T265 is written but untested — no Linux machine to hand
+>
+> ### Any other RealSense camera
 >
 > Use [upstream](https://github.com/realsenseai/librealsense) — this fork offers you nothing extra, and carries restoration code you do not need.
 >
