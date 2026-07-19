@@ -679,7 +679,7 @@ This also closes the outstanding "cannot claim D400-class cameras are unregresse
 
 ---
 
-## 11. L500 status — 2026-07-19 (does not compile yet)
+## 11. L500 status — 2026-07-19 (COMPILES CLEAN)
 
 Branch `l500-restore`, off `master`. **`BUILD_WITH_L500` defaults OFF**, so none of this can
 affect a normal build. T265 remains working and unaffected.
@@ -690,9 +690,12 @@ Compile errors across successive build rounds, each measured not estimated:
 
 ```
 958 → 830 → 793 → 641 → 634 → 543 → 525 → 491 → 453 → 245
+    → 251 → 129 → 67 → 59 → 36 → 42 → 20 → 9 → 3 → 2 → 0
 ```
 
-**74% reduction.** As with T265, the raw count massively overstated the work — a handful of
+**✅ Clean compile.** `realsense2` builds with `BUILD_WITH_L500=ON`, exit 0, no link errors.
+The count rose twice — each time a fix exposed work that earlier errors had masked, which is
+the normal shape of this rather than a regression. As with T265, the raw count massively overstated the work — a handful of
 relocations were fanning out across hundreds of lines. The single biggest win was
 `time_service` (453 → 245).
 
