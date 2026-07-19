@@ -95,6 +95,11 @@ namespace rs2
         bool supports_on_chip_calib();
         bool draw_stream_selection(std::string& error_message);
         bool is_selected_combination_supported();
+        // The viewer tracks one resolution per sensor. Returns the resolution a given stream
+        // should actually be matched at, which is the shared selection unless that stream
+        // does not offer it.
+        std::pair< int, int > effective_resolution_for( rs2_stream stream_type,
+                                                        std::pair< int, int > shared ) const;
         void select_resolution( int width, int height, rs2_stream stream = RS2_STREAM_ANY );
         std::vector< stream_profile > get_selected_profiles( bool enforce_inter_stream_policies = true );
         std::vector<stream_profile> get_supported_profiles();
