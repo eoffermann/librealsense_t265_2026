@@ -35,6 +35,11 @@ namespace rs2
 {
     void prepare_config_file();
 
+    // Defined in model-views.cpp. Declared here so the T265 localization-map import/export
+    // in device-model.cpp can reach them.
+    std::vector<uint8_t> bytes_from_bin_file(const std::string& filename);
+    void bin_file_from_bytes(const std::string& filename, const std::vector<uint8_t> bytes);
+
     bool frame_metadata_to_csv( const std::string & filename, rs2::frame frame );
 
     bool motion_data_to_csv( const std::string & filename, rs2::frame frame );
@@ -84,6 +89,63 @@ namespace rs2
     using face = std::array<float3, 4>;
     using colored_cube = std::array<std::pair<face, color>, 6>;
     using tracked_point = std::pair<rs2_vector, unsigned int>; // translation and confidence
+
+    class tm2_model
+    {
+    public:
+        tm2_model() : _trajectory_tracking(true)
+        {
+        }
+        void draw_trajectory(bool is_trajectory_button_pressed);
+        void update_model_trajectory(const pose_frame& pose, bool track);
+        void record_trajectory(bool on) { _trajectory_tracking = on; };
+        void reset_trajectory() { trajectory.clear(); };
+
+    private:
+        void add_to_trajectory(tracked_point& p);
+
+        const float len_x = 0.1f;
+        const float len_y = 0.03f;
+        const float len_z = 0.01f;
+        /*
+        4--------------------------3
+        /|                         /|
+        5-|------------------------6 |
+        | /1                       | /2
+        |/                         |/
+        7--------------------------8
+        */
+        float3 v1{ -len_x / 2, -len_y / 2,  len_z / 2 };
+        float3 v2{ len_x / 2, -len_y / 2,  len_z / 2 };
+        float3 v3{ len_x / 2,  len_y / 2,  len_z / 2 };
+        float3 v4{ -len_x / 2,  len_y / 2,  len_z / 2 };
+        float3 v5{ -len_x / 2,  len_y / 2, -len_z / 2 };
+        float3 v6{ len_x / 2,  len_y / 2, -len_z / 2 };
+        float3 v7{ -len_x / 2, -len_y / 2, -len_z / 2 };
+        float3 v8{ len_x / 2, -len_y / 2, -len_z / 2 };
+        face f1{ { v1,v2,v3,v4 } }; //Back
+        face f2{ { v2,v8,v6,v3 } }; //Right side
+        face f3{ { v4,v3,v6,v5 } }; //Top side
+        face f4{ { v1,v4,v5,v7 } }; //Left side
+        face f5{ { v7,v8,v6,v5 } }; //Front
+        face f6{ { v1,v2,v8,v7 } }; //Bottom side
+
+        std::array<color, 6> colors{ {
+            { { 0.5f, 0.5f, 0.5f } }, //Back
+        { { 0.7f, 0.7f, 0.7f } }, //Right side
+        { { 1.0f, 0.7f, 0.7f } }, //Top side
+        { { 0.7f, 0.7f, 0.7f } }, //Left side
+        { { 0.4f, 0.4f, 0.4f } }, //Front
+        { { 0.7f, 0.7f, 0.7f } }  //Bottom side
+            } };
+
+        colored_cube camera_box{ { { f1,colors[0] },{ f2,colors[1] },{ f3,colors[2] },{ f4,colors[3] },{ f5,colors[4] },{ f6,colors[5] } } };
+
+        std::vector<tracked_point> trajectory;
+        std::vector<float2> boundary;
+        bool                _trajectory_tracking;
+
+    };
 
     class press_button_model
     {

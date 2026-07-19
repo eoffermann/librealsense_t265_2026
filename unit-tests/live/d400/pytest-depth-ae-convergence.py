@@ -1,8 +1,8 @@
 # License: Apache 2.0. See LICENSE file in root directory.
 # Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
 
-# CI timeout set to 10 minutes to accommodate comprehensive testing of all
-# supported depth profiles
+# CI timeout set to 10 minutes to accommodate the nightly full-profile sweep.
+# The default (gating) test only exercises a single resolution and is fast.
 
 """
 Depth Auto-Exposure (AE) Convergence Qualification Test
@@ -23,6 +23,12 @@ Method:
   7. If auto_exposure_mode option is supported, test both REGULAR (0) and ACCELERATED (1)
      modes, asserting accelerated convergence <= regular convergence * factor.
 
+Coverage:
+  - test_depth_ae_convergence: gating/default run, single default resolution only, so
+    the gate stays short and does not hammer the USB controller with reconfigurations.
+  - test_depth_ae_convergence_all_resolutions: nightly-only, sweeps the full depth
+    profile matrix.
+
 Pass / Fail (defaults):
   REGULAR mode must converge within 1.5s.
   ACCELERATED mode (if supported) must converge within 0.8s and faster than regular.
@@ -37,7 +43,6 @@ import os, time
 from pprint import pformat
 import pyrealsense2 as rs
 import pyrsutils as rsutils
-from rspy import tests_wrapper as tw
 from rspy.pytest.device_helpers import require_min_fw_version
 import logging
 log = logging.getLogger(__name__)
@@ -47,13 +52,6 @@ pytestmark = [
     pytest.mark.timeout(600),
 ]
 
-
-@pytest.fixture(autouse=True)
-def _start_stop_wrapper(test_device):
-    dev, _ = test_device
-    tw.start_wrapper(dev)
-    yield
-    tw.stop_wrapper(dev)
 
 # -----------------------------------------------------------------------------------------------
 # Configuration (with environment overrides)
@@ -66,12 +64,21 @@ SPEED_FACTOR = float(1.15)  # regular >= accelerated * 1.15 expected
 TIMEOUT_REGULAR = max(REGULAR_MAX * 1.5, REGULAR_MAX + 0.5)
 TIMEOUT_ACCEL = max(ACCEL_MAX * 1.5, ACCEL_MAX + 0.5)
 
+# Let the USB endpoints tear down between stream reconfigurations. Back-to-back
+# stop/close -> open storms can wedge the host USB controller on CI machines.
+SETTLE_DELAY = float(0.5)  # seconds
+
 # Available AE modes
 REGULAR = 0.0
 ACCELERATED = 1.0
 
 # -----------------------------------------------------------------------------------------------
 # Helper Functions
+
+def _settle():
+    """Pause so USB endpoints fully tear down before the next open()."""
+    time.sleep(SETTLE_DELAY)
+
 
 def has_metadata(frame, md):
     try:
@@ -97,8 +104,13 @@ def measure_convergence(sensor, profile, max_allowed=1.0, timeout=2.0):
     Returns (status, details_dict)
       status: 'passed' | 'failed' | 'skipped'
       details_dict: contains timings, samples, reason (for skip/fail)
+
+    If the profile exposes no ACTUAL_EXPOSURE metadata (no frames recorded) the
+    result is 'skipped' - so a separate metadata-probe streaming cycle is not needed.
     """
-    # Ensure streaming stopped
+    # Ensure streaming stopped before reopening. No settle needed here: every measurement
+    # exits with a settle, so a preceding cycle already left a gap, and nothing is streaming
+    # on the very first call.
     try:
         sensor.stop(); sensor.close()
     except Exception:
@@ -168,11 +180,12 @@ def measure_convergence(sensor, profile, max_allowed=1.0, timeout=2.0):
         if time.time() - enable_wall_time > mode_timeout:
             break
 
-    # Stop streaming
+    # Stop streaming, then let the USB endpoints settle before the next open
     try:
         sensor.stop(); sensor.close()
     except Exception:
         pass
+    _settle()
 
     # Prepare return details and always include collected samples
     base = {
@@ -218,55 +231,15 @@ def measure_convergence(sensor, profile, max_allowed=1.0, timeout=2.0):
     return ('passed' if converged_time is not None and converged_time <= max_allowed else 'failed'), base
 
 
-def check_metadata_availability(sensor, profile, timeout=2.0):
-    """Open the given profile briefly and confirm per-frame metadata is present."""
-    try:
-        # ensure sensor is not streaming
-        try:
-            sensor.stop(); sensor.close()
-        except Exception:
-            pass
-
-        ok = { 'frame_seen': False, 'has_exposure': False, 'has_gain': False }
-
-        def cb(f):
-            if not f.is_depth_frame():
-                return
-            ok['frame_seen'] = True
-            try:
-                ok['has_exposure'] = f.supports_frame_metadata(rs.frame_metadata_value.actual_exposure)
-            except Exception:
-                ok['has_exposure'] = False
-            try:
-                ok['has_gain'] = f.supports_frame_metadata(rs.frame_metadata_value.gain_level)
-            except Exception:
-                ok['has_gain'] = False
-
-        sensor.open(profile)
-        sensor.start(cb)
-
-        t0 = time.time()
-        while time.time() - t0 < timeout and not ok['frame_seen']:
-            time.sleep(0.02)
-
-        try:
-            sensor.stop(); sensor.close()
-        except Exception:
-            pass
-
-        return ok['frame_seen'] and ok['has_exposure']
-    except Exception:
-        try:
-            sensor.stop(); sensor.close()
-        except Exception:
-            pass
-        return False
-
 # -----------------------------------------------------------------------------------------------
-# Run Tests
+# Shared setup / execution
 
-def test_depth_ae_convergence(test_device):
-    dev, _ = test_device
+def _prepare_depth_ae_sensor(dev):
+    """Common setup: FW gate, depth sensor, AE support and the candidate profile list.
+
+    Skips the test (via pytest.skip) if the device can't run it.
+    Returns (sensor, supports_mode, depth_profiles).
+    """
     require_min_fw_version(dev, rsutils.version(5, 17, 0, 10), "AE convergence", inclusive=False)
 
     sensor = dev.first_depth_sensor()
@@ -277,24 +250,38 @@ def test_depth_ae_convergence(test_device):
     supports_mode = sensor.supports(rs.option.auto_exposure_mode)
     log.info(f"Depth AE mode: [{supports_mode}]")
 
-    # Track all test results
-    test_results = []  # List of (config_name, passed: bool)
-
-    # Run AE convergence for all supported depth profiles (resolution + fps)
-    # Exclude profiles with frame rates lower than 15 fps from testing
+    # Candidate depth profiles (resolution + fps); exclude frame rates lower than 15 fps
     depth_profiles = [p for p in sensor.profiles if p.stream_type() == rs.stream.depth and p.fps() >= 15]
     if not depth_profiles:
-        pytest.skip('Requested depth profile 640x480@30 not found - exiting')
+        pytest.skip('No depth profiles >= 15fps found - exiting')
+
+    return sensor, supports_mode, depth_profiles
+
+
+def _select_default_profile(sensor, depth_profiles):
+    """Pick the depth sensor's default stream profile via the SDK's is_default() flag
+    (the camera's out-of-the-box resolution), mirroring how other live tests choose their
+    profile. Falls back to the first candidate profile if the sensor flags no default."""
+    default = next((p for p in sensor.profiles
+                    if p.stream_type() == rs.stream.depth and p.is_default()), None)
+    if default is not None:
+        return default
+    vsp0 = depth_profiles[0].as_video_stream_profile()
+    log.warning(f"Depth sensor flags no default profile; falling back to "
+                f"{vsp0.width()}x{vsp0.height()}@{depth_profiles[0].fps()}")
+    return depth_profiles[0]
+
+
+def _run_ae_convergence(sensor, supports_mode, depth_profiles):
+    """Run AE convergence over the given depth profiles and assert the overall result."""
+    # Track all test results
+    test_results = []  # List of (config_name, passed: bool)
 
     for prof in depth_profiles:
         fmt = f"{prof.as_video_stream_profile().width()}x{prof.as_video_stream_profile().height()}@{prof.fps()}"
         # Skip 60, 90 fps and 300 fps test cases
         if prof.fps() == 60 or prof.fps() == 90 or prof.fps() == 300:
             log.info(f"Skipping 60,90,300 fps test case: {fmt}")
-            continue
-        # Verify metadata is available for this profile before running the test
-        if not check_metadata_availability(sensor, prof):
-            log.info(f"Depth frames for profile {fmt} do not expose ACTUAL_EXPOSURE metadata - skipping profile")
             continue
         # Regular
         # Adjust allowed convergence time for low frame-rate profiles (e.g., 6fps)
@@ -334,8 +321,6 @@ def test_depth_ae_convergence(test_device):
             log.info(f"REGULAR [{fmt}] AE samples={details.get('samples')}")
             log.info(f"REGULAR [{fmt}] exposures: {format_list_abbrev(details.get('exposures', []))}")
             log.info(f"REGULAR [{fmt}] gains: {format_list_abbrev(details.get('gains', []))}")
-            log.info(f"REGULAR AE exposures [{fmt}]: {format_list_abbrev(details.get('exposures', []))}")
-            log.info(f"REGULAR AE gains [{fmt}]: {format_list_abbrev(details.get('gains', []))}")
 
             # ACCELERATED AE mode test (if supported)
             if supports_mode:
@@ -384,8 +369,13 @@ def test_depth_ae_convergence(test_device):
                         log.info(f"ACCELERATED [{fmt}] AE samples={accel_details.get('samples')}")
                         log.info(f"ACCELERATED [{fmt}] exposures: {format_list_abbrev(accel_details.get('exposures', []))}")
                         log.info(f"ACCELERATED [{fmt}] gains: {format_list_abbrev(accel_details.get('gains', []))}")
-                        log.info(f"ACCELERATED AE exposures [{fmt}]: {format_list_abbrev(accel_details.get('exposures', []))}")
-                        log.info(f"ACCELERATED AE gains [{fmt}]: {format_list_abbrev(accel_details.get('gains', []))}")
+
+                    # Restore REGULAR mode so subsequent profiles measure the REGULAR baseline
+                    # in the correct mode (measure_convergence never resets auto_exposure_mode).
+                    try:
+                        sensor.set_option(rs.option.auto_exposure_mode, REGULAR)
+                    except Exception:
+                        pass
 
     # -----------------------------------------------------------------------------------------------
     # Evaluate Overall Test Results (10% failure threshold)
@@ -405,9 +395,37 @@ def test_depth_ae_convergence(test_device):
             for name in failed_configs:
                 log.info(f"  - {name}")
 
-        # Apply 10% threshold: only fail if more than 10% of configs failed
+        # Apply 10% threshold: only fail if more than 10% of configs failed. The SAME bar is
+        # used for the gating (single profile) and nightly (full matrix) runs — the only
+        # difference between them is how many profiles are exercised, not the pass criterion.
         FAILURE_THRESHOLD = 10.0  # 10%
         assert failure_rate <= FAILURE_THRESHOLD, \
             f"Failure rate {failure_rate:.1f}% exceeds {FAILURE_THRESHOLD}% threshold ({failure_count}/{total_configs} configs failed)"
     else:
         log.warning("No configurations were tested")
+
+
+# -----------------------------------------------------------------------------------------------
+# Run Tests
+
+def test_depth_ae_convergence(test_device_wrapped):
+    """Gating/default run: exercise a single default resolution only, keeping the gate
+    short and avoiding a storm of USB stream reconfigurations."""
+    dev, _ = test_device_wrapped
+    sensor, supports_mode, depth_profiles = _prepare_depth_ae_sensor(dev)
+
+    default_profile = _select_default_profile(sensor, depth_profiles)
+    vsp = default_profile.as_video_stream_profile()
+    fmt = f"{vsp.width()}x{vsp.height()}@{default_profile.fps()}"
+    log.info(f"Testing AE convergence on default depth profile [{fmt}]")
+
+    _run_ae_convergence(sensor, supports_mode, [default_profile])
+
+
+@pytest.mark.context("nightly")
+def test_depth_ae_convergence_all_resolutions(test_device_wrapped):
+    """Nightly-only run: sweep the full depth profile matrix (resolution + fps)."""
+    dev, _ = test_device_wrapped
+    sensor, supports_mode, depth_profiles = _prepare_depth_ae_sensor(dev)
+
+    _run_ae_convergence(sensor, supports_mode, depth_profiles)

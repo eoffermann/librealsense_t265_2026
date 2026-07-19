@@ -12,6 +12,9 @@
 #include "ds/d500/d500-info.h"
 #include "fw-update/fw-update-factory.h"
 #include "platform-camera.h"
+#ifdef WITH_TRACKING
+#include "tm2/tm-info.h"
+#endif
 
 #include <librealsense2/h/rs_context.h>
 
@@ -207,6 +210,14 @@ backend_device_factory::create_devices_from_group( platform::backend_device_grou
             auto d500_devices = d500_info::pick_d500_devices( ctx, devices );
             std::copy( begin( d500_devices ), end( d500_devices ), std::back_inserter( list ) );
         }
+
+#ifdef WITH_TRACKING
+        if( mask & RS2_PRODUCT_LINE_T200 )
+        {
+            auto tm2_devices = tm2_info::pick_tm2_devices( ctx, devices.usb_devices );
+            std::copy( begin( tm2_devices ), end( tm2_devices ), std::back_inserter( list ) );
+        }
+#endif
 
         // Supported recovery devices
         {

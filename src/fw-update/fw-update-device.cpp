@@ -11,6 +11,7 @@
 #include <rsutils/time/stopwatch.h>
 
 #include <chrono>
+#include <iomanip>
 #include <stdexcept>
 #include <algorithm>
 #include <thread>
@@ -95,6 +96,18 @@ namespace librealsense
                   << "\n\tHighest ever installed: " << _highest_fw_version );
     }
 
+    std::string update_device::parse_serial_number(const std::vector<uint8_t>& buffer) const
+    {
+        if (buffer.size() != sizeof(serial_number_data))
+            throw std::runtime_error("DFU - failed to parse serial number!");
+
+        std::stringstream rv;
+        for (size_t i = 0; i < sizeof(serial_number_data::serial); i++)
+            rv << std::setfill('0') << std::setw(2) << std::hex << static_cast<int>(buffer[i]);
+
+        return rv.str();
+    }
+
     std::ostream & operator<<( std::ostream & os, rs2_dfu_state state )
     {
         switch( state )
@@ -147,7 +160,6 @@ namespace librealsense
 
     float update_device::compute_progress(float progress, float start, float end, float threshold) const
     {
-        // NOTE: this is usually overriden; see derived classes!
         if( threshold > 1.f )
             progress = ceil( progress * threshold ) / threshold;
         return start + progress * (end - start);
@@ -279,21 +291,27 @@ namespace librealsense
 
     void update_device::dfu_manifest_phase(const platform::rs_usb_messenger& messenger, rs2_update_progress_callback_sptr update_progress_callback) const
     {
-        // After the zero length DFU_DNLOAD request terminates the Transfer
-        // phase, the device is ready to manifest the new firmware. As described
-        // previously, some devices may accumulate the firmware image and perform
-        // the entire reprogramming operation at one time. Others may have only a
-        // small amount remaining to be reprogrammed, and still others may have
-        // none. Regardless, the device enters the dfuMANIFEST-SYNC state and
-        // awaits the solicitation of the status report by the host. Upon receipt
-        // of the anticipated DFU_GETSTATUS, the device enters the dfuMANIFEST
-        // state, where it completes its reprogramming operations.
+        // Manifestation phase: the device programs the new firmware, then either holds dfuMANIFEST-WAIT-RESET (manifestation-tolerant)
+        // or resets itself immediately (per USB DFU 1.1). Reaching WAIT_RESET or losing the device (control-transfer failure)
+        // both mean success; only an explicit DFU error state is a failure.
+        auto start = std::chrono::system_clock::now();
+        while (true)
+        {
+            dfu_status_payload status;
+            uint32_t transferred = 0;
+            auto sts = messenger->control_transfer(0xa1 /*DFU_GETSTATUS_PACKET*/, RS2_DFU_GET_STATUS, 0, 0, (uint8_t*)&status, sizeof(status), transferred, 5000);
 
-        // WaitForDFU state sends several DFU_GETSTATUS requests, until we hit
-        // either RS2_DFU_STATE_DFU_MANIFEST_WAIT_RESET or RS2_DFU_STATE_DFU_ERROR status.
-        // This command also reset the device
-        if (!wait_for_state(messenger, RS2_DFU_STATE_DFU_MANIFEST_WAIT_RESET, 20000))
-            throw std::runtime_error("Firmware manifest failed");
+            if (sts != platform::RS2_USB_STATUS_SUCCESS)   // device reset after manifestation
+                return;
+            if (status.is_in_state(RS2_DFU_STATE_DFU_MANIFEST_WAIT_RESET))
+                return;
+            if (status.is_error_state())
+                throw std::runtime_error("Firmware manifest failed with an error");
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(DEFAULT_TIMEOUT));
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start) >= std::chrono::milliseconds(20000))
+                throw std::runtime_error("Firmware manifest failed. Timeout waiting for device reset.");
+        }
     }
 
     void update_device::update_mipi(const void* fw_image, int fw_image_size, rs2_update_progress_callback_sptr update_progress_callback) const

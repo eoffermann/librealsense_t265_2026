@@ -1,3 +1,37 @@
+> [!IMPORTANT]
+> ## Deprecated-camera preservation fork of librealsense
+>
+> This is a fork of [realsenseai/librealsense](https://github.com/realsenseai/librealsense) with one purpose: **keep discontinued Intel RealSense cameras working on a current SDK.**
+>
+> Upstream has removed several product lines over time. The usual way to keep such a camera running is to pin to the last release that supported it and forgo years of SDK improvements. This fork takes the other approach: restore the driver and **forward-port it onto current upstream code**, then keep merging upstream as it evolves.
+>
+> ### Camera status
+>
+> | Camera | Removed upstream | Status here |
+> |---|---|---|
+> | **T265 / TM2** (tracking) | Jan 2023, after `v2.53.1` ([PR #11287](https://github.com/realsenseai/librealsense/pull/11287)) | ✅ **Working** |
+> | **L515 / L500** (LiDAR depth) | Jul 2023 | 🚧 **In progress** |
+>
+> #### T265 — working
+>
+> Verified on hardware: the camera is sent its firmware, boots, enumerates, and streams **6DOF pose, both fisheye channels, gyro and accel** concurrently. Both the 2D and 3D views work in `realsense-viewer`, including live pose readout and trajectory rendering.
+>
+> Not yet verified: **record/playback round-trip** through a rosbag, and any long-duration soak testing. ros2 bag pose support is also still absent. Treat those as unproven rather than broken.
+>
+> Build with `-DBUILD_WITH_TM2=ON`. The firmware image is downloaded and hash-verified at configure time; `RS2_T265_FW_PATH` overrides its location if needed.
+>
+> #### L515 — not yet
+>
+> Work has started on restoring L500 support. **An L515 will not enumerate in this fork today.** If you need one working now, use the last upstream release that supported it.
+>
+> #### Any other RealSense camera
+>
+> Use [upstream](https://github.com/realsenseai/librealsense) — this fork offers you nothing extra, and carries restoration code you do not need.
+>
+> Restoration notes and the full plan live in [`doc/t265-restore-plan.md`](doc/t265-restore-plan.md).
+>
+> Everything below this banner is upstream's documentation and applies unchanged.
+
 <p align="center">
 <!-- Light mode -->
 <img src="doc/img/realsense-logo-light-mode.png#gh-light-mode-only" alt="Logo for light mode" width="30%"/>

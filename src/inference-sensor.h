@@ -18,7 +18,7 @@ MAP_EXTENSION( RS2_EXTENSION_INFERENCE_SENSOR, librealsense::inference_sensor );
 
 
 
-class object_detection_sensor
+class object_detection_sensor : public virtual inference_sensor
 {
 public:
     virtual ~object_detection_sensor() = default;

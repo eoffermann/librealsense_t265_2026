@@ -128,7 +128,7 @@ typedef struct rs2_object_detection
     int top_left_y;     /**< Top-left corner pixel Y coordinate */
     int bottom_right_x; /**< Bottom-right corner pixel X coordinate */
     int bottom_right_y; /**< Bottom-right corner pixel Y coordinate */
-    float depth;        /**< Mean depth in meters at detection location */
+    float depth;        /**< Distance to detected object in meters, as computed by firmware */
 } rs2_object_detection;
 
 /** \brief Severity of the librealsense logger. */
@@ -212,6 +212,7 @@ typedef enum rs2_extension
     RS2_EXTENSION_SUPPORTED_EMBEDDED_FILTERS,
     RS2_EXTENSION_DECIMATION_EMBEDDED_FILTER,
     RS2_EXTENSION_TEMPORAL_EMBEDDED_FILTER,
+    RS2_EXTENSION_CLOSE_RANGE_EMBEDDED_FILTER,
     RS2_EXTENSION_INFERENCE_FRAME,
     RS2_EXTENSION_OBJECT_DETECTION_FRAME,
     RS2_EXTENSION_INFERENCE_SENSOR,
@@ -284,6 +285,7 @@ typedef enum rs2_embedded_filter_type
     RS2_EMBEDDED_FILTER_TYPE_FIRST,
     RS2_EMBEDDED_FILTER_TYPE_DECIMATION = RS2_EMBEDDED_FILTER_TYPE_FIRST,
     RS2_EMBEDDED_FILTER_TYPE_TEMPORAL,
+    RS2_EMBEDDED_FILTER_TYPE_CLOSE_RANGE,
     RS2_EMBEDDED_FILTER_TYPE_COUNT
 } rs2_embedded_filter_type;
 const char* rs2_embedded_filter_type_to_string(rs2_embedded_filter_type embedded_filter);

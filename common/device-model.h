@@ -361,9 +361,12 @@ namespace rs2
 
         bool show_advanced_mode_popup = false;
         
-        bool subdevice_has_inference_stream_enabled( const subdevice_model & sub );
+        bool subdevice_has_inference_stream_enabled( const subdevice_model & sub ) const;
         bool are_color_and_depth_streaming() const;
         void stop_inference_if_video_stopped( viewer_model & viewer );
+        // Inference and the decimation/temporal embedded filters are mutually exclusive.
+        bool is_inference_streaming() const;
+        bool is_inference_blocking_filter_enabled() const;
 
         void draw_info_icon(ux_window& window, ImFont* font, const ImVec2& size);
         int draw_seek_bar();

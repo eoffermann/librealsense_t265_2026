@@ -2,10 +2,13 @@
 # Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
 
 import asyncio
+import platform
+import struct
 import threading
 import time
 import logging
-from typing import Dict, List, Optional, Any, Tuple, Set
+from collections import deque
+from typing import Callable, Deque, Dict, List, Optional, Any, Tuple, Set
 import pyrealsense2 as rs
 import numpy as np
 import cv2
@@ -26,7 +29,15 @@ from datetime import datetime
 from app.services.metadata_socket_server import MetadataSocketServer
 
 
+_IS_WINDOWS = platform.system() == "Windows"
+
 FW_STATUS_UNKNOWN = "unknown"
+
+# Recent color frames retained per device for texturing the 3D point cloud.
+# Five frames at 30 fps covers the typical depth/color SDK-latency offset
+# (~one capture interval); the picker selects the entry whose timestamp is
+# closest to the depth frame being processed.
+COLOR_FRAME_HISTORY = 5
 
 
 class RealSenseManager:
@@ -56,7 +67,10 @@ class RealSenseManager:
         self.lock = threading.Lock()
         self.max_queue_size = 5
         self.is_pointcloud_enabled: Dict[str, bool] = {}
-        self.pc = rs.pointcloud()
+        # One rs.pointcloud() per device: pc.map_to(color) mutates internal
+        # state, and depth/color threads from different devices would race on
+        # a shared instance (texturing device A's cloud with device B's color).
+        self.point_clouds: Dict[str, "rs.pointcloud"] = {}
 
         # Caches for pipeline/config reuse to reduce startup cost
         self.config_cache: Dict[str, Dict[str, rs.config]] = {}  # device -> signature -> config
@@ -68,6 +82,26 @@ class RealSenseManager:
 
         # Store latest raw depth frames for pixel depth queries
         self.depth_frames: Dict[str, Any] = {}  # device_id -> rs.depth_frame
+
+        # Short history of recent color frames per device for texturing the
+        # 3D point cloud. Sensor-mode runs depth/color on independent threads
+        # so the depth thread looks up the closest-by-timestamp color frame
+        # here via ``_pick_color_for_depth``. Cross-sensor matching by
+        # ``frame.get_timestamp()`` only works because ``start_sensor`` sets
+        # ``global_time_enabled`` on the sensor — without that, different
+        # sensors can report timestamps in different clock domains (a fixed
+        # multi-second offset). A deque(maxlen=N) gives O(1) bounded append
+        # and atomic-under-GIL pop-on-overflow, which the previous
+        # list+pop(0) pattern did not.
+        self.color_frames: Dict[str, Deque[Any]] = {}  # device_id -> deque of rs.video_frame, oldest first
+
+        # Cache of supported frame_metadata values keyed by device_id then profile uid.
+        # Nested so a single device's profiles can be evicted without wiping others.
+        # Avoids re-probing every metadata key on every frame in the hot loop.
+        self._supported_md_by_profile: Dict[str, Dict[int, list]] = {}
+
+        # Firmware update tracking (one update at a time per device)
+        self._fw_updates_in_progress: Set[str] = set()
 
         self.sio = sio
         self.metadata_socket_server = MetadataSocketServer(sio, self)
@@ -97,6 +131,102 @@ class RealSenseManager:
         # Initialize devices
         self.refresh_devices()
 
+        # Refresh devices when one is plugged in or out.
+        self.ctx.set_devices_changed_callback(self._on_devices_changed)
+
+    def _on_devices_changed(self, info) -> None:
+        """rs.context devices-changed callback. Runs on a pyrealsense2 internal thread."""
+        added: List[str] = []
+        removed: List[str] = []
+        with self.lock:
+            new_devs = list(info.get_new_devices())
+            for serial, dev in list(self.devices.items()):
+                if info.was_removed(dev):
+                    removed.append(serial)
+            for serial in removed:
+                self._remove_device(serial)
+            for dev in new_devs:
+                serial = self._register_new_device(dev)
+                if serial is not None:
+                    added.append(serial)
+
+        for serial in removed:
+            self.metadata_socket_server.stop_broadcast(serial)
+
+        if added or removed:
+            logging.info("devices_changed: +%s -%s", added, removed)
+            self._emit_socket_event("devices_changed", {"added": added, "removed": removed})
+
+    def _remove_device(self, serial: str) -> None:
+        assert self.lock.locked(), "_remove_device called without self.lock held"
+        self.pipelines.pop(serial, None)
+        self.configs.pop(serial, None)
+        self.active_streams.pop(serial, None)
+        self.frame_queues.pop(serial, None)
+        self.metadata_queues.pop(serial, None)
+        self.depth_frames.pop(serial, None)
+        self.color_frames.pop(serial, None)
+        self.point_clouds.pop(serial, None)
+        # Drop the point-cloud-enabled flag so a re-plug of the same serial
+        # doesn't silently resume emitting PC metadata that the UI thinks is
+        # off (frontend resets to off on disconnect).
+        self.is_pointcloud_enabled.pop(serial, None)
+        self.devices.pop(serial, None)
+        self.device_infos.pop(serial, None)
+        self._supported_md_by_profile.pop(serial, None)
+        self.streaming_mode.pop(serial, None)
+
+    def _register_new_device(self, dev: rs.device) -> Optional[str]:
+        """Cache a freshly-discovered rs.device + its DeviceInfo. Caller must hold self.lock."""
+        assert self.lock.locked(), "_register_new_device called without self.lock held"
+        if not dev.supports(rs.camera_info.serial_number):
+            return None
+        device_id = dev.get_info(rs.camera_info.serial_number)
+
+        if device_id in self.devices:
+            return None
+
+        def _info(key, default=None):
+            try:
+                return dev.get_info(key)
+            except RuntimeError:
+                return default
+
+        sensors: List[str] = [
+            sensor.get_info(rs.camera_info.name)
+            for sensor in dev.sensors
+            if sensor.supports(rs.camera_info.name)
+        ]
+
+        metadata_enabled: Optional[bool] = None
+        if _IS_WINDOWS:
+            try:
+                metadata_enabled = dev.is_metadata_enabled()
+            except RuntimeError:
+                pass
+
+        info = DeviceInfo(
+            device_id=device_id,
+            name=_info(rs.camera_info.name, "Unknown Device"),
+            serial_number=device_id,
+            firmware_version=_info(rs.camera_info.firmware_version),
+            recommended_firmware_version=None,
+            firmware_status=FW_STATUS_UNKNOWN,
+            firmware_file_available=False,
+            physical_port=_info(rs.camera_info.physical_port),
+            usb_type=_info(rs.camera_info.usb_type_descriptor),
+            product_id=_info(rs.camera_info.product_id),
+            sensors=sensors,
+            is_streaming=device_id in self.pipelines,
+            metadata_enabled=metadata_enabled,
+        )
+        # Publish atomically at the end — if anything above raises, no partial
+        # cache entry is left behind. Keep new work above this block.
+        self.devices[device_id] = dev
+        self.device_infos[device_id] = info
+        self.streaming_mode.setdefault(device_id, "idle")
+        return device_id
+
     def _emit_socket_event(self, event: str, payload: Dict[str, Any]) -> None:
         """Emit a Socket.IO event from sync contexts using the main FastAPI event loop."""
         loop = RealSenseManager._main_loop
@@ -109,91 +239,36 @@ class RealSenseManager:
             logging.warning("Socket emit failed (%s): %s", event, exc)
 
     def refresh_devices(self) -> List[DeviceInfo]:
-        """Refresh the list of connected devices"""
+        """Refresh the list of connected devices.
+
+        Public entry point; skips ctx enumeration while a firmware update is in
+        progress to avoid the polling thread invalidating the FW thread's
+        ``rs.device`` handles (which causes ``null pointer passed for argument
+        "device"`` on the subsequent ``update_dev.update(...)`` call). The FW
+        thread itself uses ``_refresh_devices_locked`` directly to bypass the
+        guard once DFU is complete.
+        """
+        with self.lock:
+            if self._fw_updates_in_progress:
+                logging.debug(
+                    "refresh_devices: skipping ctx enumeration — FW update(s) in progress: %s",
+                    self._fw_updates_in_progress,
+                )
+                return list(self.device_infos.values())
+        return self._refresh_devices_locked()
+
+    def _refresh_devices_locked(self) -> List[DeviceInfo]:
+        """Actual device enumeration (no FW-in-progress guard)."""
         with self.lock:
             # Clear existing devices (that aren't streaming)
             for device_id in list(self.devices.keys()):
                 if device_id not in self.pipelines:
                     del self.devices[device_id]
-                    if device_id in self.device_infos:
-                        del self.device_infos[device_id]
+                    self.device_infos.pop(device_id, None)
+                    self._supported_md_by_profile.pop(device_id, None)
 
-            # Discover connected devices
             for dev in self.ctx.devices:
-                # Try to get device serial number - skip devices that don't support it
-                # (e.g., devices in DFU/update mode)
-                try:
-                    if not dev.supports(rs.camera_info.serial_number):
-                        logging.debug("Skipping device without serial number support (likely in DFU mode)")
-                        continue
-                    device_id = dev.get_info(rs.camera_info.serial_number)
-                except RuntimeError as e:
-                    logging.debug("Skipping device that doesn't support serial number: %s", e)
-                    continue
-
-                # Skip already known devices
-                if device_id in self.devices:
-                    continue
-
-                self.devices[device_id] = dev
-
-                # Extract device information
-                try:
-                    name = dev.get_info(rs.camera_info.name)
-                except RuntimeError:
-                    name = "Unknown Device"
-
-                try:
-                    firmware_version = dev.get_info(rs.camera_info.firmware_version)
-                except RuntimeError:
-                    firmware_version = None
-
-                # Bundled firmware support was removed; we no longer compare against a recommended version.
-                recommended_version = None
-                fw_file_exists = False
-                firmware_status = FW_STATUS_UNKNOWN
-
-                try:
-                    physical_port = dev.get_info(rs.camera_info.physical_port)
-                except RuntimeError:
-                    physical_port = None
-
-                try:
-                    usb_type = dev.get_info(rs.camera_info.usb_type_descriptor)
-                except RuntimeError:
-                    usb_type = None
-
-                try:
-                    product_id = dev.get_info(rs.camera_info.product_id)
-                except RuntimeError:
-                    product_id = None
-
-                # Get sensors
-                sensors = []
-                for sensor in dev.sensors:
-                    try:
-                        sensor_name = sensor.get_info(rs.camera_info.name)
-                        sensors.append(sensor_name)
-                    except RuntimeError:
-                        pass
-
-                # Create device info object
-                device_info = DeviceInfo(
-                    device_id=device_id,
-                    name=name,
-                    serial_number=device_id,
-                    firmware_version=firmware_version,
-                    recommended_firmware_version=recommended_version,
-                    firmware_status=firmware_status,
-                    firmware_file_available=fw_file_exists,
-                    physical_port=physical_port,
-                    usb_type=usb_type,
-                    product_id=product_id,
-                    sensors=sensors,
-                    is_streaming=device_id in self.pipelines,
-                )
-
-                self.device_infos[device_id] = device_info
+                self._register_new_device(dev)
 
             # Update cache timestamp after a successful refresh
             import time
@@ -236,20 +311,456 @@ class RealSenseManager:
             "file_available": False,
         }
 
+    @staticmethod
+    def _is_update_device(dev: rs.device) -> bool:
+        """True if the device exposes the DFU update interface.
+
+        Some pyrealsense2 builds return an empty rs.update_device wrapper
+        (truthy Python object, null underlying pointer) instead of throwing
+        for a non-DFU device. Validate the wrapper via bool() to catch that.
+        """
+        try:
+            up = rs.update_device(dev)
+            return bool(up)
+        except Exception:
+            return False
+
+    def update_firmware_from_bytes(self, device_id: str, fw_bytes: bytes) -> Dict[str, Any]:
+        """Run firmware update using a user-supplied image blob.
+
+        Reuses the DFU flow: check_firmware_compatibility -> enter_update_state ->
+        wait for DFU device -> update_dev.update(image, on_progress) -> wait for reconnect.
+        Emits the same Socket.IO progress / success / failure events as a bundled-image update.
+        """
+        self._claim_fw_update_slot(device_id)
+        try:
+            self._ensure_fw_update_allowed(device_id)
+            # pyrealsense2 accepts bytes-like objects; bytearray keeps memory
+            # bounded (list(bytes) would balloon ~28x by boxing each byte).
+            try:
+                fw_image = bytearray(fw_bytes)
+            except Exception as exc:
+                logging.error("Failed to materialize firmware bytes: %s", exc)
+                raise RealSenseError(status_code=400, detail="Invalid firmware payload")
+
+            # Re-fetch the device handle directly from the SDK context. The cached
+            # `self.devices[device_id]` Python wrapper can outlive its underlying
+            # C++ device pointer when refresh_devices() runs concurrently (the
+            # 5-second polling loop) or when the device re-enumerates between
+            # the GET /devices call and this POST, producing a wrapper that is
+            # still truthy but whose C++ pointer is null. Passing such a handle
+            # to rs.updatable() raises `null pointer passed for argument "device"`.
+            target_dev = self._resolve_live_device(device_id)
+            firmware_update_id = self._resolve_firmware_update_id(target_dev, device_id)
+
+            progress_holder, on_progress = self._make_fw_progress_callback(device_id)
+            # Always emit a starting progress so the UI doesn't stay at 0% forever
+            self._emit_socket_event(
+                f"firmware_progress_{device_id}",
+                {"device_id": device_id, "progress": 0.0},
+            )
+
+            try:
+                update_dev = self._enter_dfu_and_get_update_dev(
+                    target_dev, fw_image, device_id, firmware_update_id,
+                )
+                if not update_dev:
+                    raise RealSenseError(
+                        status_code=500,
+                        detail="Could not obtain a valid DFU device handle for the update",
+                    )
+
+                logging.info("Starting firmware update on DFU device...")
+                update_dev.update(fw_image, on_progress)
+                self._post_update_hardware_reset(update_dev)
+
+                logging.info("Firmware download completed, waiting for device to finalize...")
+                time.sleep(3)
+
+                # Drop SDK references to the pre-DFU handles; they will be
+                # invalidated by the device re-enumeration. The ctx itself is
+                # kept — replacing it would silently drop the
+                # set_devices_changed_callback registration done in __init__,
+                # and the post-DFU device-back event would never reach us.
+                update_dev = None
+                target_dev = None
+
+                self._wait_for_device_reconnect(device_id, firmware_update_id)
+            except RealSenseError:
+                raise
+            except Exception as exc:
+                logging.exception("Firmware update failed for %s", device_id)
+                self._emit_socket_event(
+                    f"firmware_update_failed_{device_id}",
+                    {"device_id": device_id, "error": str(exc)},
+                )
+                raise RealSenseError(status_code=500, detail=f"Firmware update failed: {exc}")
+
+            updated_info = self._refresh_until_device_returns(device_id)
+
+            self._emit_socket_event(
+                f"firmware_progress_{device_id}",
+                {"device_id": device_id, "progress": 1.0},
+            )
+            self._emit_socket_event(
+                f"firmware_update_success_{device_id}",
+                {
+                    "device_id": device_id,
+                    "firmware_version": updated_info.firmware_version if updated_info else None,
+                },
+            )
+
+            return {
+                "device_id": device_id,
+                "progress": progress_holder["value"],
+                "firmware_version": updated_info.firmware_version if updated_info else None,
+                "status": "success",
+            }
+        except RealSenseError as exc:
+            self._emit_socket_event(
+                f"firmware_update_failed_{device_id}",
+                {"device_id": device_id, "error": exc.detail},
+            )
+            raise
+        finally:
+            with self.lock:
+                self._fw_updates_in_progress.discard(device_id)
+
+    # ---- update_firmware_from_bytes helpers ---------------------------------
+    # Split out so the orchestrator above reads as a sequence of named steps
+    # rather than a 300-line block of intermixed locking, SDK calls, polling,
+    # and socket emission.
+
+    def _claim_fw_update_slot(self, device_id: str) -> None:
+        """Reserve the per-device FW-update slot; raise 409 if one is already running."""
+        with self.lock:
+            if device_id in self._fw_updates_in_progress:
+                raise RealSenseError(status_code=409, detail="Firmware update already in progress")
+            self._fw_updates_in_progress.add(device_id)
+
+    def _resolve_live_device(self, device_id: str) -> rs.device:
+        """Return an rs.device for ``device_id`` enumerated fresh from self.ctx.
+
+        Avoids using ``self.devices[device_id]`` directly: that cached wrapper
+        can be invalidated underneath by a concurrent refresh_devices() (the
+        polling loop), leaving a truthy Python object backed by a null C++
+        pointer. Raises 404 if the device is no longer visible.
+        """
+        for dev in self.ctx.query_devices():
+            try:
+                if not dev.supports(rs.camera_info.serial_number):
+                    continue
+                if dev.get_info(rs.camera_info.serial_number) == device_id:
+                    # Refresh the cache so downstream callers (refresh_devices)
+                    # observe the same live handle.
+                    with self.lock:
+                        self.devices[device_id] = dev
+                    return dev
+            except RuntimeError:
+                continue
+        raise RealSenseError(status_code=404, detail=f"Device {device_id} not found")
+
+    def _ensure_fw_update_allowed(self, device_id: str) -> None:
+        """Reject the update if the device is unknown or if anything is streaming."""
+        if device_id not in self.devices:
+            raise RealSenseError(status_code=404, detail=f"Device {device_id} not found")
+        # Only refuse if THIS device is streaming. Since we no longer recreate
+        # self.ctx during the update, other devices' handles stay valid and
+        # their pipelines are unaffected by the DFU transition of this device.
+        with self.lock:
+            if device_id in self.pipelines:
+                raise RealSenseError(
+                    status_code=400,
+                    detail="Stop streaming on this device before updating firmware",
+                )
+
+    @staticmethod
+    def _resolve_firmware_update_id(target_dev: rs.device, device_id: str) -> str:
+        """Return FIRMWARE_UPDATE_ID (stable across DFU transitions) or fall back to device_id."""
+        firmware_update_id: Optional[str] = None
+        try:
+            if target_dev.supports(rs.camera_info.firmware_update_id):
+                firmware_update_id = target_dev.get_info(rs.camera_info.firmware_update_id)
+            else:
+                sensors = target_dev.query_sensors()
+                if sensors:
+                    firmware_update_id = sensors[0].get_info(rs.camera_info.firmware_update_id)
+        except RuntimeError:
+            pass
+        if not firmware_update_id:
+            firmware_update_id = device_id
+        logging.info("Firmware update id for tracking: %s", firmware_update_id)
+        return firmware_update_id
+
+    def _make_fw_progress_callback(
+        self, device_id: str,
+    ) -> Tuple[Dict[str, float], Callable[[float], None]]:
+        """Build the on_progress callback and a holder dict that records the latest value.
+
+        Rate-limits emissions to ~10/sec but always lets the final 100% through.
+        """
+        progress_holder = {"value": 0.0}
+        last_emit_ts = {"value": 0.0}
+
+        def _on_progress(p: float) -> None:
+            progress_holder["value"] = p
+            now = time.time()
+            if now - last_emit_ts["value"] < 0.1 and p < 1.0:
+                return
+            last_emit_ts["value"] = now
+            self._emit_socket_event(
+                f"firmware_progress_{device_id}",
+                {"device_id": device_id, "progress": float(p)},
+            )
+
+        return progress_holder, _on_progress
+
+    def _enter_dfu_and_get_update_dev(
+        self,
+        target_dev: rs.device,
+        fw_image: bytearray,
+        device_id: str,
+        firmware_update_id: str,
+    ):
+        """Return a DFU update_device — either the device is already in DFU, or push it there.
+
+        Runs the compatibility check, drops cached refs, calls enter_update_state(), and
+        polls the SDK until the matching DFU device shows up (or raises on timeout).
+        """
+        try:
+            update_dev = rs.update_device(target_dev)
+            # Some pyrealsense2 builds return an empty wrapper for non-DFU
+            # devices instead of throwing. bool() returns False on the empty
+            # wrapper, so treat that as "not in DFU yet" and fall through to
+            # the enter_update_state path below.
+            if update_dev:
+                logging.info("Device is already in DFU mode")
+                return update_dev
+        except Exception:
+            pass
+
+        logging.info("Device is in normal mode, checking firmware compatibility...")
+        updatable = rs.updatable(target_dev)
+
+        try:
+            if not updatable.check_firmware_compatibility(fw_image):
+                raise RealSenseError(status_code=400, detail="Firmware is not compatible with this device")
+            logging.info("Firmware compatibility check passed")
+        except RealSenseError:
+            raise
+        except Exception as e:
+            logging.warning("Firmware compatibility check failed or not supported: %s", e)
+
+        # Cached refs will become invalid after enter_update_state.
+        with self.lock:
+            self._remove_device(device_id)
+        self._emit_socket_event(
+            "devices_changed", {"added": [], "removed": [device_id]},
+        )
+
+        logging.info("Requesting device to enter DFU mode...")
+        updatable.enter_update_state()
+
+        update_dev = self._wait_for_dfu_device(firmware_update_id)
+        if not update_dev:
+            raise RealSenseError(
+                status_code=500,
+                detail="Device did not enter DFU mode within timeout. Please reconnect the device and try again.",
+            )
+        return update_dev
+
+    def _wait_for_dfu_device(self, firmware_update_id: str, timeout_seconds: int = 60):
+        """Poll self.ctx until a DFU device matching firmware_update_id appears; return it or None.
+
+        Falls back to "exactly one visible DFU device" when firmware_update_id isn't reported.
+        """
+        start_time = time.time()
+        while time.time() - start_time < timeout_seconds:
+            time.sleep(0.5)
+            try:
+                devs = self.ctx.query_devices()
+                for dev in devs:
+                    try:
+                        candidate = rs.update_device(dev)
+                    except Exception:
+                        continue
+                    # Empty wrapper from a non-DFU device (some pyrealsense2
+                    # builds return one rather than throwing). Skip — calling
+                    # update() on it later raises 'null pointer for "device"'.
+                    if not candidate:
+                        continue
+                    try:
+                        if dev.supports(rs.camera_info.firmware_update_id):
+                            dev_fw_id = dev.get_info(rs.camera_info.firmware_update_id)
+                            if dev_fw_id == firmware_update_id:
+                                return candidate
+                    except RuntimeError:
+                        pass
+                    # Fallback: if exactly one DFU device is visible, assume it's ours.
+                    if sum(1 for d in devs if self._is_update_device(d)) == 1:
+                        return candidate
+            except Exception as e:
+                logging.debug("Error querying devices during DFU wait: %s", e)
+                continue
+        return None
+
+    @staticmethod
+    def _post_update_hardware_reset(update_dev) -> None:
+        # update_dev.update() is supposed to call hardware_reset() internally
+        # (see common/fw-update-helper.cpp), but on some devices/firmware
+        # combos the device stays in DFU/recovery mode. Issue an explicit
+        # reset as a belt-and-suspenders kick to force USB re-enumeration.
+        try:
+            update_dev.hardware_reset()
+            logging.info("Issued explicit hardware_reset() on DFU device after update")
+        except Exception as exc:
+            logging.warning("Explicit hardware_reset() on DFU device failed (likely benign): %s", exc)
+
+    def _wait_for_device_reconnect(
+        self, device_id: str, firmware_update_id: str, max_wait_seconds: int = 120,
+    ) -> None:
+        """Wait for the device to re-enumerate in normal mode after DFU.
+
+        Polls ``self.ctx.query_devices()`` once a second. The SDK's
+        devices-changed callback (registered once in ``__init__``) also fires
+        when the device returns; we don't touch self.ctx here because
+        replacing it would silently drop that callback registration.
+
+        Raises RealSenseError if the device sticks in DFU/recovery; logs and returns
+        if it simply never reappears within the timeout (update may have succeeded).
+        """
+        reconnected = False
+        stuck_in_dfu = False
+        start_time = time.time()
+        while time.time() - start_time < max_wait_seconds:
+            time.sleep(1)
+            try:
+                devs = self.ctx.query_devices()
+                # First pass: look for the device in NORMAL mode.
+                for dev in devs:
+                    try:
+                        if self._is_update_device(dev):
+                            continue
+                        sensors = dev.query_sensors()
+                        if sensors:
+                            try:
+                                dev_fw_id = sensors[0].get_info(rs.camera_info.firmware_update_id)
+                                if dev_fw_id == firmware_update_id:
+                                    reconnected = True
+                                    break
+                            except RuntimeError:
+                                pass
+                        try:
+                            if dev.supports(rs.camera_info.serial_number):
+                                sn = dev.get_info(rs.camera_info.serial_number)
+                                if sn == device_id:
+                                    reconnected = True
+                                    break
+                        except RuntimeError:
+                            pass
+                    except Exception:
+                        continue
+                if reconnected:
+                    break
+                # Second pass: is the device still sitting in DFU/recovery?
+                stuck_in_dfu = False
+                for dev in devs:
+                    try:
+                        if not self._is_update_device(dev):
+                            continue
+                        try:
+                            if dev.supports(rs.camera_info.firmware_update_id):
+                                dev_fw_id = dev.get_info(rs.camera_info.firmware_update_id)
+                                if dev_fw_id == firmware_update_id:
+                                    stuck_in_dfu = True
+                                    break
+                        except RuntimeError:
+                            pass
+                        # Fallback: any DFU device counts if we don't have ID match.
+                        stuck_in_dfu = True
+                    except Exception:
+                        continue
+            except Exception as e:
+                logging.debug("Error querying devices during reconnect wait: %s", e)
+                continue
+
+        if reconnected:
+            return
+        if stuck_in_dfu:
+            logging.error(
+                "Device %s is stuck in DFU/recovery mode after firmware update. "
+                "The firmware image may be incompatible or the update did not finalize.",
+                device_id,
+            )
+            msg = (
+                "Device is stuck in recovery (DFU) mode after the update. "
+                "Please physically disconnect and reconnect the device, then try again "
+                "with a known-good firmware image."
+            )
+            self._emit_socket_event(
+                f"firmware_update_failed_{device_id}",
+                {"device_id": device_id, "error": msg},
+            )
+            raise RealSenseError(status_code=500, detail=msg)
+        logging.warning("Device did not reconnect within timeout, but update may have succeeded")
+
+    def _refresh_until_device_returns(
+        self, device_id: str, attempts: int = 8,
+    ) -> Optional[DeviceInfo]:
+        """Re-enumerate until device_id reappears in device_infos.
+
+        Calls ``_refresh_devices_locked`` directly to bypass the
+        ``_fw_updates_in_progress`` guard on the public ``refresh_devices``: the
+        FW slot is still claimed at this point (released in the outer
+        ``finally``), but DFU has finished and we own the FW thread, so it's
+        safe — and necessary — to enumerate.
+        """
+        # The USB re-enumeration may lag behind the SDK's first query. Give it
+        # a few seconds to settle, then retry until the device reappears.
+        time.sleep(3)
+        for attempt in range(attempts):
+            self._refresh_devices_locked()
+            updated_info = self.device_infos.get(device_id)
+            if updated_info:
+                logging.info(
+                    "Device %s re-appeared after firmware update (attempt %d)",
+                    device_id, attempt + 1,
+                )
+                return updated_info
+            logging.debug(
+                "Device %s not yet visible after firmware update (attempt %d)",
+                device_id, attempt + 1,
+            )
+            time.sleep(1)
+        logging.warning(
+            "Device %s did not reappear after firmware update; "
+            "frontend will keep polling.", device_id,
+        )
+        return None
+
     def reset_device(self, device_id: str) -> bool:
         """Reset a specific device by ID"""
-        if device_id not in self.devices:
-            self.refresh_devices()
+        with self.lock:
             if device_id not in self.devices:
                 raise RealSenseError(
                     status_code=404, detail=f"Device {device_id} not found"
                 )
+            dev = self.devices[device_id]
+            self._remove_device(device_id)
 
-        dev = self.devices[device_id]
+        self._emit_socket_event("devices_changed", {"added": [], "removed": [device_id]})
+
         try:
             dev.hardware_reset()
             return True
-        except RuntimeError as e:
+        except Exception as e:
+            # Reset failed: handle still valid, device still plugged in.
+            # Restore cache + announce device back so FE stops showing it as gone.
+            with self.lock:
+                self._register_new_device(dev)
+            self._emit_socket_event(
+                "devices_changed", {"added": [device_id], "removed": []},
+            )
             raise RealSenseError(
                 status_code=500, detail=f"Failed to reset device: {str(e)}"
             )
@@ -947,11 +1458,7 @@ class RealSenseManager:
             # Update device info
             if device_id in self.device_infos:
                 self.device_infos[device_id].is_streaming = True
-            threading.Thread(
-                target=self.metadata_socket_server.start_broadcast,
-                args=(device_id,),
-                daemon=True,
-            ).start()
+            self.metadata_socket_server.start_broadcast(device_id)
             timings['thread_start'] = time.perf_counter() - t6
             timings['total'] = time.perf_counter() - t0
             logging.debug("[TIMING] start_stream timings for %s: %s", device_id, timings)
@@ -992,7 +1499,7 @@ class RealSenseManager:
 
         def _do_stop():
             try:
-                self.metadata_socket_server.stop_broadcast()
+                self.metadata_socket_server.stop_broadcast(device_id)
                 self.pipelines[device_id].stop()
             except Exception as e:
                 logging.error("Failed to stop streaming for %s: %s", device_id, e)
@@ -1005,6 +1512,9 @@ class RealSenseManager:
                     self.pipeline_signatures.pop(device_id, None)
                     self.frame_queues.pop(device_id, None)
                     self.metadata_queues.pop(device_id, None)
+                    self.color_frames.pop(device_id, None)
+                    self.point_clouds.pop(device_id, None)
+                    self._supported_md_by_profile.pop(device_id, None)
                     self.stopping.discard(device_id)
                     # Reset streaming mode to idle
                     self.streaming_mode[device_id] = "idle"
@@ -1177,6 +1687,220 @@ class RealSenseManager:
                     detail=f"Stream type '{stream_key}' is not active for device {device_id}.",
                 )
 
+    # TODO: replace with `list(rs.frame_metadata_value)` once pyrealsense2 ships
+    # with pybind11 >= 2.12 (added __iter__ on py::enum_). Current PyPI wheels
+    # use older pybind11 where the enum is not iterable.
+    _FRAME_METADATA_VALUES = list(rs.frame_metadata_value.__members__.values())
+
+    @staticmethod
+    def _build_viewer_info(frame_data) -> Dict[str, Any]:
+        """Top metadata block, mirrors C++ realsense-viewer."""
+        profile = frame_data.get_profile()
+        actual_fps_key = rs.frame_metadata_value.actual_fps
+        hardware_fps = profile.fps()
+        if frame_data.supports_frame_metadata(actual_fps_key):
+            try:
+                hardware_fps = frame_data.get_frame_metadata(actual_fps_key) / 1000.0
+            except Exception as exc:
+                logging.debug("[METADATA] failed to read %s: %s", actual_fps_key.name, exc)
+        info: Dict[str, Any] = {
+            "timestamp": frame_data.get_timestamp(),
+            "frame_number": frame_data.get_frame_number(),
+            "clock_domain": frame_data.get_frame_timestamp_domain().name,
+            "pixel_format": profile.format().name,
+            "hardware_fps": hardware_fps,
+        }
+        try:  # video frames only; motion frames have no width/height
+            info["width"] = frame_data.get_width()
+            info["height"] = frame_data.get_height()
+            vsp = profile.as_video_stream_profile()
+            info["hardware_width"] = vsp.width()
+            info["hardware_height"] = vsp.height()
+        except Exception:
+            pass
+        return info
+
+    def _get_frame_metadata(self, frame_data, device_id: str) -> Dict[str, int]:
+        """Return all rs2_frame_metadata_value attributes the frame supports.
+        Mirrors common/stream-model.cpp:52-59 in the C++ realsense-viewer.
+        Caches the supported subset per (device, profile uid) so the steady-state
+        per-frame cost is one dict lookup + N get_frame_metadata calls."""
+        try:
+            profile_uid = frame_data.get_profile().unique_id()
+        except Exception:
+            profile_uid = None
+
+        device_cache = self._supported_md_by_profile.get(device_id)
+        supported = device_cache.get(profile_uid) if (device_cache is not None and profile_uid is not None) else None
+        # Build the supported set from the 2nd frame on: delta-computed metadata
+        # (e.g. actual_fps) is not yet available on the first frame.
+        if supported is None and frame_data.get_frame_number() >= 2:
+            supported = [md for md in self._FRAME_METADATA_VALUES
+                         if frame_data.supports_frame_metadata(md)]
+            if profile_uid is not None:
+                if device_cache is None:
+                    device_cache = self._supported_md_by_profile[device_id] = {}
+                device_cache[profile_uid] = supported
+
+        attrs: Dict[str, int] = {}
+        for md in (supported or []):
+            try:
+                attrs[md.name] = frame_data.get_frame_metadata(md)
+            except Exception as e:
+                # supports_frame_metadata said yes; getting the value should not throw.
+                logging.debug("[METADATA] failed to read %s: %s", md.name, e)
+                continue
+        return attrs
+
+    # Cap the number of vertices shipped per frame so payload/decode/render cost
+    # stays roughly constant regardless of stream resolution.
+    POINT_CLOUD_MAX_VERTICES = 60000
+
+    def _build_point_cloud_metadata(self, device_id: str, depth_frame, color_frame=None) -> Optional[Dict]:
+        """Compute decimated point-cloud vertices from a depth frame, ready for serialization.
+
+        When ``color_frame`` is supplied and it's an RGB8/BGR8 frame, this also
+        samples a per-vertex RGB triplet using the texture coordinates produced
+        by ``rs.pointcloud.map_to`` — mirrors the C++ realsense-viewer's textured
+        point cloud rendering. The client falls back to a depth colormap when
+        ``colors`` is absent.
+
+        Uses a per-device ``rs.pointcloud`` so map_to()/calculate() can't race
+        across devices.
+
+        Returns None if calculate() yields nothing. Used by both the pipeline-mode
+        frame collector and the sensor-mode frame processor.
+        """
+        pc = self.point_clouds.get(device_id)
+        if pc is None:
+            pc = rs.pointcloud()
+            self.point_clouds[device_id] = pc
+        if color_frame:
+            try:
+                pc.map_to(color_frame)
+            except Exception:
+                color_frame = None  # not all profiles support map_to; fall back silently
+        points = pc.calculate(depth_frame)
+        if not points:
+            return None
+        verts = np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3)
+
+        # Mask + decimate BEFORE sampling colors — at 1280x720 the full vertex
+        # buffer is ~921K entries, and sampling/copying 900K colors per depth
+        # frame was bottlenecking the depth thread down to ~1 Hz (the rotation
+        # desync the user reported: by the time depth_T was ready, color was
+        # already at color_T+1s). Sampling at the final ~60K decimated indices
+        # is ~15x less work.
+        mask = verts[:, 2] >= 0.03  # drop invalid near-camera points
+        verts = verts[mask]
+        count = len(verts)
+        step = 1
+        if count > self.POINT_CLOUD_MAX_VERTICES:
+            step = (count // self.POINT_CLOUD_MAX_VERTICES) + 1
+            verts = verts[::step]
+
+        colors_rgb: Optional[np.ndarray] = None
+        if color_frame:
+            tex = np.asanyarray(points.get_texture_coordinates()).view(np.float32).reshape(-1, 2)
+            tex = tex[mask]
+            if step > 1:
+                tex = tex[::step]
+            colors_rgb = self._sample_color_at_tex(tex, color_frame)
+
+        # Contiguous so .tobytes() in the socket server is a straight memcpy.
+        verts = np.ascontiguousarray(verts, dtype=np.float32)
+        result: Dict[str, Any] = {"vertices": verts, "texture_coordinates": []}
+        if colors_rgb is not None:
+            result["colors"] = np.ascontiguousarray(colors_rgb, dtype=np.uint8)
+        return result
+
+    def _pick_color_for_depth(self, device_id: str, depth_frame) -> Optional[Any]:
+        """Pick the cached color frame whose timestamp is closest to the depth
+        frame's. Both timestamps come from ``frame.get_timestamp()``, which —
+        with ``global_time_enabled`` set on the sensors at start time — are
+        translated by the SDK into a unified system-time domain regardless of
+        which sensor produced them. The short history covers the typical
+        depth/color SDK-latency offset (~one capture interval) so the picked
+        color reflects the same real-time moment as the depth.
+        """
+        # Snapshot the deque before iterating — the color sensor thread can
+        # append/evict concurrently and `for cf in deque` is not safe against
+        # that. tuple() captures the current frame refs atomically under GIL.
+        hist = self.color_frames.get(device_id)
+        if not hist:
+            return None
+        snapshot = tuple(hist)
+        if not snapshot:
+            return None
+        try:
+            depth_ts = depth_frame.get_timestamp()
+        except RuntimeError:
+            return snapshot[-1]
+        best = snapshot[-1]
+        best_dt = float("inf")
+        for cf in snapshot:
+            try:
+                dt = abs(cf.get_timestamp() - depth_ts)
+            except RuntimeError:
+                continue
+            if dt < best_dt:
+                best_dt = dt
+                best = cf
+        return best
+
+    def _is_color_streaming(self, device_id: str) -> bool:
+        """Whether 'color' is currently in this device's active stream set.
+
+        Used by the sensor-mode depth thread to decide whether the cached color
+        frame in ``self.color_frames`` is still fresh enough to texture-map the
+        cloud. Pipeline mode reads color straight from the frameset and doesn't
+        need this — the frameset already drops disabled streams.
+        """
+        mode = self.streaming_mode.get(device_id)
+        if mode == "pipeline":
+            return any(s.lower() == "color" for s in self.active_streams.get(device_id, set()))
+        if device_id in self.sensor_streams:
+            for sensor_info in self.sensor_streams[device_id].values():
+                if not sensor_info.get("is_streaming", False):
+                    continue
+                if any(st.lower() == "color" for st in sensor_info.get("stream_types", [])):
+                    return True
+        return False
+
+    @staticmethod
+    def _sample_color_at_tex(tex: np.ndarray, color_frame) -> Optional[np.ndarray]:
+        """Return Nx3 uint8 RGB sampled at the supplied texture coordinates.
+
+        ``tex`` is the already-masked, already-decimated tex-coord array (Nx2,
+        u/v in [0,1]) — sampling per-vertex on the full pre-decimation buffer
+        is too slow at 1280x720. Only handles RGB8 / BGR8 color frames; other
+        formats (YUYV, Y16, …) return None and the client falls back to the
+        depth colormap.
+        """
+        try:
+            color_format = color_frame.get_profile().format()
+        except Exception:
+            return None
+        if color_format not in (rs.format.rgb8, rs.format.bgr8):
+            return None
+        cim = np.asanyarray(color_frame.get_data())
+        if cim.ndim != 3 or cim.shape[2] < 3:
+            return None
+        H, W = cim.shape[:2]
+        u = tex[:, 0]
+        v = tex[:, 1]
+        # rs2 emits tex coords outside [0,1] for depth pixels that don't project
+        # into the color frame — mark those black instead of clamping (clamping
+        # would smear the frame borders across off-screen points).
+        valid = (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0)
+        xi = np.clip((u * W).astype(np.int32), 0, W - 1)
+        yi = np.clip((v * H).astype(np.int32), 0, H - 1)
+        sampled = cim[yi, xi][:, :3].astype(np.uint8, copy=True)
+        sampled[~valid] = 0
+        if color_format == rs.format.bgr8:
+            sampled = sampled[:, ::-1]  # BGR -> RGB so the client doesn't need to swap
+        return sampled
+
     def _collect_frames(self, device_id: str, align_processor=None):
         """Thread function to collect frames from the pipeline"""
         logging.debug("[INFO] Frame collection thread started for device %s", device_id)
@@ -1218,8 +1942,7 @@ class RealSenseManager:
                         try:
                             frame = None
                             frame_data = None
-                            points = None
-                            
+
                             # Use the rs_stream enum directly for comparison
                             if rs_stream == rs.stream.depth:
                                 frame_data = frames.get_depth_frame()
@@ -1230,8 +1953,6 @@ class RealSenseManager:
                                     self.depth_frames[device_id] = frame_data
                                     colorized = colorizer.colorize(frame_data)
                                     frame = np.asanyarray(colorized.get_data())
-                                    if self.is_pointcloud_enabled.get(device_id, False):
-                                        points = self.pc.calculate(frame_data)
                             elif rs_stream == rs.stream.color:
                                 frame_data = frames.get_color_frame()
                                 if frame_data:
@@ -1272,21 +1993,28 @@ class RealSenseManager:
 
                             # Add metadata
                             metadata = {
-                                "timestamp": frame_data.get_timestamp(),
-                                "frame_number": frame_data.get_frame_number(),
-                                "width": getattr(frame_data, "get_width", lambda: 640)() or 640,
-                                "height": getattr(frame_data, "get_height", lambda: 480)() or 480,
+                                "frame_metadata": self._get_frame_metadata(frame_data, device_id),
+                                **self._build_viewer_info(frame_data),
                             }
 
                             if rs_stream == rs.stream.gyro or rs_stream == rs.stream.accel:
                                 if motion_json_data:
                                     metadata["motion_data"] = motion_json_data
 
-                            if points:
-                                v, t = points.get_vertices(), points.get_texture_coordinates()
-                                verts = np.asanyarray(v).view(np.float32).reshape(-1, 3)
-                                verts = verts[verts[:, 2] >= 0.03]  # Filter out z < 0.03
-                                metadata["point_cloud"] = {"vertices": verts, "texture_coordinates": []}
+                            if rs_stream == rs.stream.depth and self.is_pointcloud_enabled.get(device_id, False):
+                                # If color is also active in this frameset, use it
+                                # to texture-map the cloud (cpp realsense-viewer
+                                # parity). get_color_frame() returns an empty
+                                # falsy frame when no color stream is enabled.
+                                # Apply the same color filters as the 2D path
+                                # uses so the textured cloud and the color tile
+                                # never diverge if filters become non-trivial.
+                                color_for_texture = frames.get_color_frame() or None
+                                if color_for_texture:
+                                    color_for_texture = self._apply_color_filters(device_id, color_for_texture)
+                                pc_meta = self._build_point_cloud_metadata(device_id, frame_data, color_for_texture)
+                                if pc_meta:
+                                    metadata["point_cloud"] = pc_meta
 
                             # Store processed frame and metadata
                             processed_frames[active_stream] = frame
@@ -1337,6 +2065,9 @@ class RealSenseManager:
                             del self.metadata_queues[device_id]
                         if device_id in self.depth_frames:
                             del self.depth_frames[device_id]
+                        self.color_frames.pop(device_id, None)
+                        self.point_clouds.pop(device_id, None)
+                        self._supported_md_by_profile.pop(device_id, None)
                         if device_id in self.device_infos:
                             self.device_infos[device_id].is_streaming = False
             except Exception:
@@ -1575,9 +2306,9 @@ class RealSenseManager:
     ) -> Tuple[Optional[Any], dict]:
         """Process a single sensor frame; return (processed_frame, metadata)."""
         processed_frame = None
+        info_source = frame  # frame to read info from after post processing is done
         metadata: dict = {
-            "timestamp": frame.get_timestamp(),
-            "frame_number": frame.get_frame_number(),
+            "frame_metadata": self._get_frame_metadata(frame, device_id),
         }
 
         if "depth" in frame_stream_name:
@@ -1586,20 +2317,41 @@ class RealSenseManager:
             self.depth_frames[device_id] = depth_frame
             colorized = colorizer.colorize(depth_frame)
             processed_frame = np.asanyarray(colorized.get_data())
-            metadata["width"] = depth_frame.get_width()
-            metadata["height"] = depth_frame.get_height()
+            info_source = depth_frame
+
+            if self.is_pointcloud_enabled.get(device_id, False):
+                # Sensor mode runs depth/color on separate threads so there is
+                # no frameset — pick the cached color frame whose timestamp is
+                # closest to this depth frame's, otherwise rotations show
+                # colors leading the geometry (color has lower SDK latency).
+                # Only do this if color is still streaming; without that check
+                # the depth thread would keep texturing with a stale frame
+                # after the user disables color.
+                color_for_texture = (
+                    self._pick_color_for_depth(device_id, depth_frame)
+                    if self._is_color_streaming(device_id)
+                    else None
+                )
+                pc_meta = self._build_point_cloud_metadata(device_id, depth_frame, color_for_texture)
+                if pc_meta:
+                    metadata["point_cloud"] = pc_meta
 
         elif "color" in frame_stream_name:
             color_frame = frame.as_video_frame()
             color_frame = self._apply_color_filters(device_id, color_frame)
+            # Append to bounded history so the depth thread can pick the color
+            # frame closest in time to the depth frame it's processing.
+            hist = self.color_frames.get(device_id)
+            if hist is None:
+                hist = deque(maxlen=COLOR_FRAME_HISTORY)
+                self.color_frames[device_id] = hist
+            hist.append(color_frame)
             processed_frame = np.asanyarray(color_frame.get_data())
-            metadata["width"] = color_frame.get_width()
-            metadata["height"] = color_frame.get_height()
+            info_source = color_frame
 
         elif "infrared" in frame_stream_name:
             processed_frame = np.asanyarray(frame.get_data())
-            metadata["width"] = frame.as_video_frame().get_width()
-            metadata["height"] = frame.as_video_frame().get_height()
+            info_source = frame.as_video_frame()
 
         elif "gyro" in frame_stream_name or "accel" in frame_stream_name:
             motion_frame = frame.as_motion_frame()
@@ -1616,9 +2368,8 @@ class RealSenseManager:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 100), 1)
             cv2.putText(processed_frame, f"Z: {motion_data.z:.3f}", (10, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 1)
-            metadata["width"] = 320
-            metadata["height"] = 120
 
+        metadata.update(self._build_viewer_info(info_source))
         return processed_frame, metadata
 
     def _collect_sensor_frames(
@@ -1784,12 +2535,37 @@ class RealSenseManager:
             
             # Validate profile compatibility (same FPS required)
             self._validate_profile_compatibility(profiles)
-            
+
+            # Translate sensor timestamps to a unified system-time domain so
+            # depth/color frames from independent sensors on the same device
+            # are directly comparable. Without this, sensors can report
+            # timestamps in different clock domains with a fixed multi-second
+            # offset, defeating cross-sensor matching for the textured point
+            # cloud (observed: 1.635s offset on the D585 prototype).
+            # WARN — not debug — when set_option fails on a sensor that
+            # supports() said yes: a partial failure silently reintroduces
+            # the cross-sensor offset and the rotation desync.
+            if sensor.supports(rs.option.global_time_enabled):
+                try:
+                    sensor.set_option(rs.option.global_time_enabled, 1)
+                except RuntimeError as e:
+                    logging.warning(
+                        "[SENSOR] %s: global_time_enabled set failed (%s) — "
+                        "depth/color may stay in different clock domains and "
+                        "textured point cloud may show rotation desync.",
+                        sensor_id, e,
+                    )
+
             # Open sensor with ALL profiles
             sensor.open(profiles)
             
-            # Create frame queue
-            rs_queue = rs.frame_queue(50, keep_frames=True)
+            # Small queue so the collector always sees fresh frames. A larger
+            # capacity (the old value was 50) lets a 1.6s FIFO backlog build up
+            # at 30 fps and the depth thread ends up always processing
+            # 1.6s-stale frames — visible as the textured 3D cloud where the
+            # color (no PC math, no backlog) reacts to motion immediately and
+            # the depth geometry lags ~1.6s behind.
+            rs_queue = rs.frame_queue(2)
             
             # Start sensor
             sensor.start(rs_queue)
@@ -1834,13 +2610,8 @@ class RealSenseManager:
                 daemon=True
             ).start()
             
-            # Start metadata broadcast if not already running
-            if not self.metadata_socket_server._is_broadcasting:
-                threading.Thread(
-                    target=self.metadata_socket_server.start_broadcast,
-                    args=(device_id,),
-                    daemon=True,
-                ).start()
+            # Start per-device metadata broadcast (no-op if already running for this device).
+            self.metadata_socket_server.start_broadcast(device_id)
             
             logging.info(f"[SENSOR] Started {sensor_id} with streams: {stream_types}")
             
@@ -1928,28 +2699,54 @@ class RealSenseManager:
             logging.warning(f"[SENSOR] Error stopping {sensor_id}: {e}")
         
         # Clean up state
+        last_sensor_stopped = False
         with self.lock:
+            # Capture the stopped sensor's stream types BEFORE removing its
+            # entry — needed below to know whether to evict cached color frames.
+            stopped_stream_types: List[str] = []
+            if (device_id in self.sensor_streams
+                    and sensor_id in self.sensor_streams[device_id]):
+                stopped_stream_types = list(
+                    self.sensor_streams[device_id][sensor_id].get("stream_types", [])
+                )
+
             if device_id in self.sensor_streams:
                 self.sensor_streams[device_id].pop(sensor_id, None)
                 if not self.sensor_streams[device_id]:
                     del self.sensor_streams[device_id]
                     self.streaming_mode[device_id] = "idle"
-            
+                    last_sensor_stopped = True
+
             if device_id in self.sensor_frame_queues:
                 self.sensor_frame_queues[device_id].pop(sensor_id, None)
                 if not self.sensor_frame_queues[device_id]:
                     del self.sensor_frame_queues[device_id]
-            
+
             if device_id in self.sensor_metadata_queues:
                 self.sensor_metadata_queues[device_id].pop(sensor_id, None)
                 if not self.sensor_metadata_queues[device_id]:
                     del self.sensor_metadata_queues[device_id]
-            
+
             if device_id in self.sensor_rs_queues:
                 self.sensor_rs_queues[device_id].pop(sensor_id, None)
                 if not self.sensor_rs_queues[device_id]:
                     del self.sensor_rs_queues[device_id]
-        
+
+            # Free the cached color frames if the stopped sensor was producing
+            # color — otherwise the 5 cached rs.video_frame refs stay pinned
+            # in the SDK pool while depth keeps streaming.
+            stopped_color = any(st.lower() == "color" for st in stopped_stream_types)
+            if stopped_color or last_sensor_stopped:
+                self.color_frames.pop(device_id, None)
+            if last_sensor_stopped:
+                # Per-device rs.pointcloud is only needed while depth runs.
+                self.point_clouds.pop(device_id, None)
+
+        # Stop the per-device metadata broadcaster once the last sensor on this
+        # device has stopped.
+        if last_sensor_stopped:
+            self.metadata_socket_server.stop_broadcast(device_id)
+
         logging.info(f"[SENSOR] Stopped {sensor_id}")
         
         return SensorStreamStatus(
@@ -2153,6 +2950,82 @@ class RealSenseManager:
                 )
             
             return queue[-1]
+
+    def send_hwm_command(
+        self,
+        device_id: str,
+        opcode: int,
+        param1: int = 0,
+        param2: int = 0,
+        param3: int = 0,
+        param4: int = 0,
+        data: Optional[List[int]] = None,
+    ) -> List[int]:
+        """Send a hardware monitor (HWM) command and return the raw firmware response.
+
+        Uses the SDK debug_protocol extension to build and transmit the command.
+
+        Args:
+            device_id: Serial number of the target device.
+            opcode: HWM opcode (e.g. 0x10 for GVD).
+            param1..param4: Optional command parameters (default 0).
+            data: Optional payload bytes appended after the header.
+
+        Returns:
+            Raw firmware response as a list of int byte values.
+
+        Raises:
+            RealSenseError 404: Device not found.
+            RealSenseError 400: Device does not support the debug_protocol extension.
+            RealSenseError 500: Firmware rejected or failed to execute the command.
+        """
+        if device_id not in self.devices:
+            self.refresh_devices()
+        with self.lock:
+            if device_id not in self.devices:
+                raise RealSenseError(
+                    status_code=404, detail=f"Device {device_id} not found"
+                )
+            dev = self.devices[device_id]
+
+        # is_debug_protocol() is the correct way to check extension support before casting.
+        # as_debug_protocol() does not raise when unsupported — it returns an empty handle
+        # whose methods would fail later with a harder-to-diagnose error.
+        if not dev.is_debug_protocol():
+            raise RealSenseError(
+                status_code=400,
+                detail=f"Device {device_id} does not support hardware monitor commands",
+            )
+
+        debug = dev.as_debug_protocol()
+        payload = list(data) if data else []
+
+        try:
+            cmd = debug.build_command(opcode, param1, param2, param3, param4, payload)
+            raw_response = debug.send_and_receive_raw_data(cmd)
+            response_bytes = list(raw_response)
+
+            # The raw response starts with a 4-byte little-endian uint32 that echoes
+            # the sent opcode on success or contains a firmware error code on failure.
+            # send_and_receive_raw_data does not raise on firmware-level errors, so we
+            # must inspect the opcode ourselves.
+            if len(response_bytes) < 4:
+                raise RealSenseError(
+                    status_code=500, detail="HWM command failed: response too short"
+                )
+            response_opcode, = struct.unpack_from('<I', bytes(response_bytes[:4]))
+            if response_opcode != opcode:
+                raise RealSenseError(
+                    status_code=500,
+                    detail=f"HWM command failed: firmware returned error code 0x{response_opcode:08X} (expected opcode echo 0x{opcode:08X})",
+                )
+            return response_bytes
+        except RealSenseError:
+            raise
+        except Exception as e:
+            raise RealSenseError(
+                status_code=500, detail=f"HWM command failed: {e}"
+            )
 
     def get_sensor_metadata(
         self,

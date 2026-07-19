@@ -55,6 +55,8 @@ SWITCH_SSH_PASS = os.environ["UNIFI_SSH_PASSWORD"]
 # channel_timeout protects against hangs during SSH channel establishment,
 # which paramiko's exec_command(timeout=) does NOT cover.
 CHANNEL_TIMEOUT = 30
+REBOOT_WAIT = 30     # let the switch's SSH accept auth again after a reboot
+REBOOT_RETRIES = 8   # discover() attempts while the switch is booting
 
 def discover(ip=SWITCH_IP, ssh_username=SWITCH_SSH_USER, ssh_password=SWITCH_SSH_PASS, retries = 0):
     """
@@ -69,6 +71,13 @@ def discover(ip=SWITCH_IP, ssh_username=SWITCH_SSH_USER, ssh_password=SWITCH_SSH
            client.connect(hostname=ip, username=ssh_username,
                                 password=ssh_password, timeout=10,
                                 channel_timeout=CHANNEL_TIMEOUT)
+           # Bound a send stalled under TCP retransmit (Linux); paramiko's timeouts
+           # guard the reply read, not the send, so a wedged switch would hang ~15min.
+           if hasattr(socket, "TCP_USER_TIMEOUT"):
+               try:
+                   client.get_transport().sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, CHANNEL_TIMEOUT * 1000)
+               except OSError as e:
+                   log.d(f"TCP_USER_TIMEOUT setsockopt failed: {e}")
            log.debug_indent()
            log.d("...", f"connected to {ip} via SSH")
            log.debug_unindent()
@@ -143,15 +152,24 @@ class UniFiSwitch(device_hub.device_hub):
         if self.client is None:
             self.client = discover(self.ip, self.username, self.password, retries=retries)
 
-        if reset:
-            # rebooting the switch takes over a minute, so the reboot code is commented out
-            # log.w("reset flag passed to unifi switch, ignoring it")
-            return
-            # self._run_command("reboot")
-            # time.sleep(5)
-            # # we need to reconnect to the device after it's rebooted, might take several tries
-            # self.disconnect()
-            # self.client = discover(retries=5)
+        if reset and self.client is not None:
+            # --hub-reset: reboot the switch (like the Acroname) to clear a wedged CLI
+            self._reboot()
+
+    def _reboot(self):
+        """
+        Reboot the switch and wait for its SSH to accept connections again.
+        """
+        log.d("rebooting UniFi switch...")
+        try:
+            self.client.exec_command("reboot", timeout=10)
+        except Exception:
+            pass  # the connection drops as the switch goes down
+        self.disconnect()
+        time.sleep(REBOOT_WAIT)
+        self.client = discover(self.ip, self.username, self.password, retries=REBOOT_RETRIES)
+        if self.client is None:
+            raise RuntimeError("UniFi switch did not come back after reboot")
 
     def is_connected(self):
         if self.client is None:

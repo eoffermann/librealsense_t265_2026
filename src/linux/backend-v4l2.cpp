@@ -93,6 +93,7 @@ constexpr uint32_t RS_CAMERA_CID_WHITE_BALANCE_MODE         = (RS_CAMERA_CID_BAS
 constexpr uint32_t RS_CAMERA_CID_PRESET                     = (RS_CAMERA_CID_BASE+21);
 constexpr uint32_t RS_CAMERA_CID_EMITTER_FREQUENCY          = (RS_CAMERA_CID_BASE+22); // [MIPI - Select projector frequency values: 0->57[KHZ], 1->91[KHZ]
 constexpr uint32_t RS_CAMERA_CID_HWMC                       = (RS_CAMERA_CID_BASE+32);
+constexpr uint32_t RS_CAMERA_CID_READOUT_SHAPING            = (RS_CAMERA_CID_BASE+34);
 
 /* refe4rence for kernel 4.9 to be removed
 #define UVC_CID_GENERIC_XU          (V4L2_CID_PRIVATE_BASE+15)
@@ -2997,6 +2998,7 @@ namespace librealsense
         const uint8_t RS_EMITTER_FREQUENCY               = 0x10; // Match to DS5_EMITTER_FREQUENCY
         const uint8_t RS_DEPTH_AUTO_EXPOSURE_MODE        = 0x11;
         const uint8_t RS_EXTERNAL_SYNC                   = 0x12;
+        const uint8_t RS_READOUT_SHAPING                 = 0x13;
 
 
         bool v4l_mipi_device::get_pu(rs2_option opt, int32_t& value) const
@@ -3171,16 +3173,16 @@ namespace librealsense
                 case RS2_OPTION_EXPOSURE: return V4L2_CID_EXPOSURE_ABSOLUTE; // Is this actually valid? I'm getting a lot of VIDIOC error 22s...
                 case RS2_OPTION_GAIN: return V4L2_CTRL_CLASS_IMAGE_SOURCE | 0x903; // v4l2-ctl --list-ctrls -d /dev/video0
                 case RS2_OPTION_GAMMA: return V4L2_CID_GAMMA;
-                case RS2_OPTION_HUE: return V4L2_CID_HUE;
+                // case RS2_OPTION_HUE: return V4L2_CID_HUE;
                 case RS2_OPTION_LASER_POWER: return V4L2_CID_EXPOSURE_ABSOLUTE;
                 case RS2_OPTION_EMITTER_ENABLED: return V4L2_CID_EXPOSURE_AUTO;
-//            case RS2_OPTION_SATURATION: return V4L2_CID_SATURATION;
-//            case RS2_OPTION_SHARPNESS: return V4L2_CID_SHARPNESS;
-//            case RS2_OPTION_WHITE_BALANCE: return V4L2_CID_WHITE_BALANCE_TEMPERATURE;
+                case RS2_OPTION_SATURATION: return V4L2_CID_SATURATION;
+                case RS2_OPTION_SHARPNESS: return V4L2_CID_SHARPNESS;
+                case RS2_OPTION_WHITE_BALANCE: return V4L2_CID_WHITE_BALANCE_TEMPERATURE;
                 case RS2_OPTION_ENABLE_AUTO_EXPOSURE: return V4L2_CID_EXPOSURE_AUTO; // Automatic gain/exposure control
-//            case RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE: return V4L2_CID_AUTO_WHITE_BALANCE;
-//            case RS2_OPTION_POWER_LINE_FREQUENCY : return V4L2_CID_POWER_LINE_FREQUENCY;
-//            case RS2_OPTION_AUTO_EXPOSURE_PRIORITY: return V4L2_CID_EXPOSURE_AUTO_PRIORITY;
+                case RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE: return V4L2_CID_AUTO_WHITE_BALANCE;
+                case RS2_OPTION_POWER_LINE_FREQUENCY : return V4L2_CID_POWER_LINE_FREQUENCY;
+                case RS2_OPTION_AUTO_EXPOSURE_PRIORITY: return V4L2_CID_EXPOSURE_AUTO_PRIORITY;
                 default: throw linux_backend_exception(rsutils::string::from() << "no v4l2 mipi mapping cid for option " << option);
             }
         }
@@ -3201,6 +3203,7 @@ namespace librealsense
                     case RS_HARDWARE_PRESET : return RS_CAMERA_CID_PRESET;
                     case RS_EMITTER_FREQUENCY : return RS_CAMERA_CID_EMITTER_FREQUENCY;
                     case RS_EXTERNAL_SYNC : return RS_CAMERA_CID_SYNC_MODE;
+                    case RS_READOUT_SHAPING : return RS_CAMERA_CID_READOUT_SHAPING;
                     // D457 Missing functionality
                     //case RS_ERROR_REPORTING: TBD;
                     //case RS_EXT_TRIGGER: TBD;

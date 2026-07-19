@@ -23,11 +23,15 @@
 #include <rsutils/accelerators/gpu.h>
 #include <rsutils/os/special-folder.h>
 #include <rsutils/string/trim-newlines.h>
+#include <rsutils/string/split.h>
 #include <common/utilities/imgui/wrap.h>
 #include <common/labeled-point-cloud-utilities.h>
+#include <common/utilities/com/center-of-mass.h>
 
 #include <rsutils/easylogging/easyloggingpp.h>
 #include <regex>
+#include <algorithm>
+#include <fstream>
 
 namespace rs2
 {
@@ -928,6 +932,7 @@ namespace rs2
         _hidden_options.emplace(RS2_OPTION_FRAMES_QUEUE_SIZE);
         _hidden_options.emplace(RS2_OPTION_NOISE_ESTIMATION);
         _hidden_options.emplace(RS2_OPTION_REGION_OF_INTEREST);
+        _hidden_options.emplace(RS2_OPTION_READOUT_SHAPING);
     }
 
     void viewer_model::update_configuration(config_file* new_cfg)
@@ -1028,8 +1033,7 @@ namespace rs2
         syncer = std::make_shared<syncer_model>();
         updates = std::make_shared<updates_model>();
         reset_camera();
-        rs2_error* e = nullptr;
-        not_model->add_log( "librealsense version: " + api_version_to_string( rs2_get_api_version( &e ) ) + "\n" );
+        not_model->add_log( rsutils::string::from() << "librealsense version: " << RS2_API_FULL_VERSION_STR << "\n" );
 
         update_configuration();
 
@@ -1322,10 +1326,37 @@ namespace rs2
         ImGui::SetCursorScreenPos(pos);
     }
 
-    // Generate streams layout, creates a grid-like layout with factor amount of columns
+    // Serial number of the camera a stream belongs to, used to key the saved tile arrangement
+    static std::string stream_serial(const stream_model* sm)
+    {
+        if (sm && sm->dev && sm->dev->dev && sm->dev->dev.supports(RS2_CAMERA_INFO_SERIAL_NUMBER))
+            return sm->dev->dev.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER);
+        return {};
+    }
+
+    // A stable per-camera identifier for a stream (type + index), so a saved arrangement can
+    // be matched back to the same streams across sessions / re-attach.
+    static std::string stream_descriptor(const stream_model* sm)
+    {
+        if (!sm) return {};
+        return std::to_string(static_cast<int>(sm->profile.stream_type())) + "_" +
+               std::to_string(sm->profile.stream_index());
+    }
+
+    // The tile title bar is drawn in the reserved strip above the frame rect. The drag grab
+    // area (and its drawn outline) extends upward by this much to include the title bar.
+    static constexpr float TILE_HEADER_HEIGHT = 32.f;
+    static rect tile_grab_rect(const rect& r)
+    {
+        return rect{ r.x, r.y - TILE_HEADER_HEIGHT, r.w, r.h + TILE_HEADER_HEIGHT };
+    }
+
+    // Generate streams layout, creates a grid-like layout with factor amount of columns.
+    // The streams are assigned to cells column-major (top-to-bottom, then next column) in
+    // the given order. The order is taken as-is (default sort or the user's arrangement).
     std::map<int, rect> generate_layout(const rect& r,
         int top_bar_height, size_t factor,
-        const std::set<stream_model*>& active_streams,
+        const std::vector<stream_model*>& streams_ordered,
         std::map<stream_model*, int>& stream_index
     )
     {
@@ -1333,33 +1364,18 @@ namespace rs2
         if (factor == 0) return results;
 
         // Calc the number of rows
-        auto complement = ceil((float)active_streams.size() / factor);
+        auto complement = ceil((float)streams_ordered.size() / factor);
 
         auto cell_width = static_cast<float>(r.w / factor);
         auto cell_height = static_cast<float>(r.h / complement);
 
-        // using the active streams sorted acc to stream type and stream index
-        // typical order will then be: depth, color, ir1, ir2, motion....
-        std::vector<stream_model*> active_streams_ordered;
-        for (auto&& active_stream : active_streams)
-        {
-            active_streams_ordered.push_back(active_stream);
-        }
-
-        std::sort(active_streams_ordered.begin(), active_streams_ordered.end(),
-            [](const stream_model* sm1, const stream_model* sm2)
-            {
-                return (sm1->profile.stream_type() < sm2->profile.stream_type()) ||
-                    ((sm1->profile.stream_type() == sm2->profile.stream_type()) && (sm1->profile.stream_index() < sm2->profile.stream_index()));
-            });
-
-        auto it = active_streams_ordered.begin();
+        auto it = streams_ordered.begin();
         for (auto x = 0; x < factor; x++)
         {
             for (auto y = 0; y < complement; y++)
             {
                 // There might be spare boxes at the end (3 streams in 2x2 array for example)
-                if (it == active_streams_ordered.end()) break;
+                if (it == streams_ordered.end()) break;
 
                 rect rxy = { r.x + x * cell_width, r.y + y * cell_height + top_bar_height,
                     cell_width, cell_height - top_bar_height };
@@ -1395,9 +1411,149 @@ namespace rs2
         }
     }
 
+    // Order the active streams for display. The default order is by stream type then index
+    // (depth, color, ir1, ir2, motion...). On top of that, each camera's tiles are placed
+    // according to the arrangement the user saved for that camera's serial (loaded from the
+    // config file); cameras with no saved arrangement keep the default order. Live drag
+    // re-arrangements are kept in the runtime _streams_order between frames.
+    std::vector<stream_model*> viewer_model::order_active_streams(
+        const std::set<stream_model*>& active_streams,
+        const std::map<stream_model*, int>& stream_index)
+    {
+        std::map<int, stream_model*> by_key;
+        for (auto&& sm : active_streams)
+            by_key[stream_index.at(sm)] = sm;
+
+        // Default order: by stream type, then stream index
+        std::vector<stream_model*> default_ordered(active_streams.begin(), active_streams.end());
+        std::sort(default_ordered.begin(), default_ordered.end(),
+            [](const stream_model* sm1, const stream_model* sm2)
+            {
+                return (sm1->profile.stream_type() < sm2->profile.stream_type()) ||
+                    ((sm1->profile.stream_type() == sm2->profile.stream_type()) && (sm1->profile.stream_index() < sm2->profile.stream_index()));
+            });
+
+        // Drop streams that are no longer active from the runtime order
+        _streams_order.erase(
+            std::remove_if(_streams_order.begin(), _streams_order.end(),
+                [&](int key) { return by_key.find(key) == by_key.end(); }),
+            _streams_order.end());
+
+        // Append newly-activated streams, keeping their default relative order
+        for (auto&& sm : default_ordered)
+        {
+            auto key = stream_index.at(sm);
+            if (std::find(_streams_order.begin(), _streams_order.end(), key) == _streams_order.end())
+                _streams_order.push_back(key);
+        }
+
+        // Apply each camera's saved arrangement: reorder a camera's streams among the slots
+        // they already occupy, following the saved descriptor order. Streams not present in
+        // the saved order (e.g. newly enabled) keep their relative position at the end.
+        std::map<std::string, std::vector<size_t>> serial_positions;
+        for (size_t i = 0; i < _streams_order.size(); i++)
+        {
+            auto kit = by_key.find(_streams_order[i]);
+            if (kit == by_key.end()) continue;
+            serial_positions[stream_serial(kit->second)].push_back(i);
+        }
+
+        for (auto&& sp : serial_positions)
+        {
+            const std::string& serial = sp.first;
+            if (serial.empty()) continue;
+
+            auto saved = get_saved_arrangement(serial);
+            if (saved.empty()) continue;
+
+            auto& positions = sp.second;
+            std::vector<int> remaining;
+            for (auto pos : positions) remaining.push_back(_streams_order[pos]);
+
+            std::vector<int> reordered;
+            for (auto&& desc : saved)
+            {
+                for (auto it = remaining.begin(); it != remaining.end(); ++it)
+                {
+                    auto kit = by_key.find(*it);
+                    if (kit != by_key.end() && stream_descriptor(kit->second) == desc)
+                    {
+                        reordered.push_back(*it);
+                        remaining.erase(it);
+                        break;
+                    }
+                }
+            }
+            for (auto key : remaining) reordered.push_back(key);
+
+            for (size_t k = 0; k < positions.size(); k++)
+                _streams_order[positions[k]] = reordered[k];
+        }
+
+        std::vector<stream_model*> ordered;
+        ordered.reserve(_streams_order.size());
+        for (auto key : _streams_order)
+        {
+            auto kit = by_key.find(key);
+            if (kit != by_key.end())
+                ordered.push_back(kit->second);
+        }
+
+        return ordered;
+    }
+
+    // Read a camera's saved tile arrangement from the config (cached in memory). Returns an
+    // empty list when the camera has no saved arrangement.
+    std::vector<std::string> viewer_model::get_saved_arrangement(const std::string& serial)
+    {
+        auto it = _stream_arrangement_by_serial.find(serial);
+        if (it != _stream_arrangement_by_serial.end())
+            return it->second;
+
+        std::vector<std::string> order;
+        std::string key = "stream_layout." + serial;
+        auto& cfg = config_file::instance();
+        if (cfg.contains(key.c_str()))
+            order = rsutils::string::split(cfg.get(key.c_str(), ""), ',');
+        _stream_arrangement_by_serial[serial] = order;
+        return order;
+    }
+
+    // Save the current arrangement of every active camera to the config, keyed by serial.
+    // Derived from the runtime _streams_order, so it captures the latest drag re-arrangement.
+    void viewer_model::persist_stream_arrangements()
+    {
+        std::map<std::string, std::vector<std::string>> by_serial;
+        for (auto key : _streams_order)
+        {
+            auto it = streams.find(key);
+            if (it == streams.end()) continue;
+            const stream_model* sm = &it->second;
+            auto serial = stream_serial(sm);
+            if (serial.empty()) continue;
+            by_serial[serial].push_back(stream_descriptor(sm));
+        }
+
+        auto& cfg = config_file::instance();
+        for (auto&& kv : by_serial)
+        {
+            _stream_arrangement_by_serial[kv.first] = kv.second;
+
+            std::string joined;
+            for (size_t i = 0; i < kv.second.size(); i++)
+            {
+                if (i) joined += ",";
+                joined += kv.second[i];
+            }
+            std::string key = "stream_layout." + kv.first;
+            cfg.set(key.c_str(), joined.c_str());
+        }
+    }
+
     std::map<int, rect> viewer_model::calc_layout(const rect& r)
     {
-        const int top_bar_height = 32;
+        // The reserved title-bar strip at the top of each cell (see tile_grab_rect)
+        const int top_bar_height = static_cast<int>(TILE_HEADER_HEIGHT);
 
         std::set<stream_model*> active_streams;
         std::map<stream_model*, int> stream_index;
@@ -1406,7 +1562,7 @@ namespace rs2
             if (stream.second.is_stream_visible())
             {
                 force_minimum_size_for_display(stream.second);
-                
+
                 active_streams.insert(&stream.second);
                 stream_index[&stream.second] = stream.first;
             }
@@ -1426,11 +1582,13 @@ namespace rs2
         }
         else
         {
+            auto streams_ordered = order_active_streams(active_streams, stream_index);
+
             // Go over all available fx(something) layouts
-            for (size_t f = 1; f <= active_streams.size(); f++)
+            for (size_t f = 1; f <= streams_ordered.size(); f++)
             {
                 auto l = generate_layout(r, top_bar_height, f,
-                    active_streams, stream_index);
+                    streams_ordered, stream_index);
 
                 // Keep the "best" layout in result
                 if (evaluate_layout(l) > evaluate_layout(results))
@@ -1439,6 +1597,59 @@ namespace rs2
         }
 
         return get_interpolated_layout(results);
+    }
+
+    // Drag one stream tile onto another to swap their positions. The swap is recorded in
+    // _streams_order and takes effect on the next calc_layout (animated by the layout
+    // interpolation). Active only while allow_streams_reorder is on.
+    void viewer_model::handle_streams_reorder(const std::map<int, rect>& layout, const mouse_info& mouse)
+    {
+        const bool down = mouse.mouse_down[0];
+        const float2 cursor = mouse.cursor;
+
+        // Find the tile (frame or its title bar) currently under the cursor
+        int hovered = -1;
+        for (auto&& kvp : layout)
+        {
+            if (tile_grab_rect(kvp.second).contains(cursor))
+            {
+                hovered = kvp.first;
+                break;
+            }
+        }
+
+        if (down && !_prev_reorder_mouse_down)
+        {
+            // Mouse pressed - start a potential drag from the hovered tile
+            _dragged_stream = hovered;
+            _drag_origin = cursor;
+            _is_dragging_stream = false;
+        }
+        else if (down && _dragged_stream != -1)
+        {
+            // Held - promote to an actual drag once moved past a small threshold
+            if ((cursor - _drag_origin).length() > 6.f)
+                _is_dragging_stream = true;
+        }
+        else if (!down && _prev_reorder_mouse_down)
+        {
+            // Released - perform the swap if dropped over a different tile
+            if (_is_dragging_stream && _dragged_stream != -1 && hovered != -1 && hovered != _dragged_stream)
+            {
+                auto it_a = std::find(_streams_order.begin(), _streams_order.end(), _dragged_stream);
+                auto it_b = std::find(_streams_order.begin(), _streams_order.end(), hovered);
+                if (it_a != _streams_order.end() && it_b != _streams_order.end())
+                {
+                    std::iter_swap(it_a, it_b);
+                    // Remember this camera's new tile arrangement (per serial) in the config
+                    persist_stream_arrangements();
+                }
+            }
+            _dragged_stream = -1;
+            _is_dragging_stream = false;
+        }
+
+        _prev_reorder_mouse_down = down;
     }
 
     rs2::frame viewer_model::handle_ready_frames(const rect& viewer_rect, ux_window& window, int devices, std::string& error_message)
@@ -1518,6 +1729,14 @@ namespace rs2
                 {
                     if (!paused)
                         lab_points = f.as<labeled_points>();
+                }
+
+                if( f.is< pose_frame >() )  // aggregate trajectory even while paused so the
+                                            // drawn path stays continuous
+                {
+                    auto dev = streams[f.get_profile().unique_id()].dev;
+                    if( dev )
+                        dev->tm2.update_model_trajectory( f.as< pose_frame >(), ! paused );
                 }
 
                 auto texture = upload_frame( std::move( f ) );
@@ -1807,6 +2026,26 @@ namespace rs2
         {
             show_no_stream_overlay(font2, static_cast<int>(view_rect.x), static_cast<int>(view_rect.y), static_cast<int>(win.width()), static_cast<int>(win.height() - output_height));
         }
+
+        // While in re-arrange mode we drive tile drag-to-swap and suppress the per-tile
+        // mouse interactions (zoom/pan/ruler) by feeding the tiles a neutral mouse.
+        const bool reorder_mode = allow_streams_reorder && !fullscreen && layout.size() > 1;
+        mouse_info neutral_mouse{};
+        neutral_mouse.cursor = neutral_mouse.prev_cursor = { -1e5f, -1e5f };
+        if (reorder_mode)
+        {
+            handle_streams_reorder(layout, mouse);
+        }
+        else
+        {
+            // Clear any drag state so a drag interrupted by leaving re-arrange mode (toggle
+            // off, fullscreen, last stream closed) can't trigger a phantom swap on re-entry.
+            _dragged_stream = -1;
+            _is_dragging_stream = false;
+            _prev_reorder_mouse_down = false;
+        }
+        const mouse_info& active_mouse = reorder_mode ? neutral_mouse : mouse;
+
         for (auto &&kvp : layout)
         {
             auto&& view_rect = kvp.second;
@@ -1816,7 +2055,7 @@ namespace rs2
             auto stream_rect = view_rect.adjust_ratio(stream_size).grow(-3);
 
             if (should_render_frame(stream_mv)) {
-                stream_mv.show_frame(stream_rect, mouse, error_message);
+                stream_mv.show_frame(stream_rect, active_mouse, error_message);
             }
 
             auto p = stream_mv.dev->dev.as<playback>();
@@ -1835,7 +2074,7 @@ namespace rs2
             }
 
             stream_mv.show_stream_header(font1, stream_rect, *this);
-            stream_mv.show_stream_footer(font1, stream_rect, mouse, streams, *this);
+            stream_mv.show_stream_footer(font1, stream_rect, active_mouse, streams, *this);
 
 
             if (val_in_range(stream_mv.profile.format(), { RS2_FORMAT_RAW10 , RS2_FORMAT_RAW16, RS2_FORMAT_MJPEG }))
@@ -1869,7 +2108,7 @@ namespace rs2
                                 stream_mv.show_stream_imu( font1,
                                                            stream_rect,
                                                            axis,
-                                                           mouse,
+                                                           active_mouse,
                                                            stream_type == RS2_STREAM_GYRO ? "Radians/Sec" : "Meter/Sec^2" );
                             }
                         }
@@ -1884,7 +2123,7 @@ namespace rs2
                                                                      { (float)motion.linear_acceleration.x,
                                                                        (float)motion.linear_acceleration.y,
                                                                        (float)motion.linear_acceleration.z },
-                                                                     mouse,
+                                                                     active_mouse,
                                                                      "Meter/Sec^2",
                                                                      "Linear Acceletion" );
                             stream_mv.show_stream_imu( font1,
@@ -1892,7 +2131,7 @@ namespace rs2
                                                        { (float)motion.angular_velocity.x,
                                                          (float)motion.angular_velocity.y,
                                                          (float)motion.angular_velocity.z },
-                                                       mouse,
+                                                       active_mouse,
                                                        "Radians/Sec",
                                                        "Angular Velocity",
                                                        height + 9 );
@@ -2006,8 +2245,8 @@ namespace rs2
                     rect const & normalized_bbox = stream_mv.profile.stream_type() == RS2_STREAM_DEPTH
                         ? object.normalized_depth_bbox
                         : object.normalized_color_bbox;
-                    rect bbox = normalized_bbox.unnormalize( stream_rect );
-                    bbox.grow( 10, 5 );  // Allow more text, and easier identification of the face
+                    rect const unbbox = normalized_bbox.unnormalize( stream_rect );
+                    rect bbox = unbbox.grow( 10, 5 );  // Allow more text, and easier identification of the face
 
                     float a = 0.75f;
                     auto frame_color = colors[2].first; // Green by default, good contrast.
@@ -2064,12 +2303,13 @@ namespace rs2
                     // The rectangle itself is always drawn, in the same color as the text
                     glColor3f( a * frame_color.Value.x, a * frame_color.Value.y, a * frame_color.Value.z );
                     draw_rect( bbox, 2 );
+
                 }
             }
 
             glColor3f(header_window_bg.x, header_window_bg.y, header_window_bg.z);
-            stream_rect.y -= 32;
-            stream_rect.h += 32;
+            stream_rect.y -= TILE_HEADER_HEIGHT;
+            stream_rect.h += TILE_HEADER_HEIGHT;
             stream_rect.w += 1;
             draw_rect(stream_rect);
 
@@ -2112,10 +2352,54 @@ namespace rs2
                     if (!distances.empty())
                     {
                         ruler_length = calculate_ruler_max_distance(distances);
-                        draw_color_ruler(mouse, streams[stream], stream_rect, rgb_per_distance_vec, ruler_length, depth_units);
+                        draw_color_ruler(active_mouse, streams[stream], stream_rect, rgb_per_distance_vec, ruler_length, depth_units);
                     }
                 }
             }
+        }
+
+        // Re-arrange mode: outline the tiles and show drag-to-swap feedback. The grab area
+        // includes the title bar strip above the frame, so the outlines do too.
+        if (reorder_mode)
+        {
+            for (auto&& kvp : layout)
+            {
+                glColor3f(light_blue.x, light_blue.y, light_blue.z);
+                draw_rect(tile_grab_rect(kvp.second).grow(-3), 1);
+            }
+
+            if (_is_dragging_stream && _dragged_stream != -1)
+            {
+                // The tile being dragged
+                auto src = layout.find(_dragged_stream);
+                if (src != layout.end())
+                {
+                    glColor3f(light_grey.x, light_grey.y, light_grey.z);
+                    draw_rect(tile_grab_rect(src->second).grow(-3), 3);
+                }
+
+                // The drop target under the cursor (frame or its title bar)
+                for (auto&& kvp : layout)
+                {
+                    if (kvp.first != _dragged_stream && tile_grab_rect(kvp.second).contains(mouse.cursor))
+                    {
+                        glColor3f(light_blue.x, light_blue.y, light_blue.z);
+                        draw_rect(tile_grab_rect(kvp.second).grow(-3), 4);
+                        break;
+                    }
+                }
+
+                // A small ghost rectangle that follows the cursor
+                if (src != layout.end())
+                {
+                    auto gw = src->second.w * 0.4f;
+                    auto gh = src->second.h * 0.4f;
+                    rect ghost{ mouse.cursor.x - gw / 2.f, mouse.cursor.y - gh / 2.f, gw, gh };
+                    glColor3f(white.x, white.y, white.z);
+                    draw_rect(ghost, 2);
+                }
+            }
+            glColor3f(1.f, 1.f, 1.f);
         }
     }
 
@@ -2178,6 +2462,60 @@ namespace rs2
 
         auto r1 = matrix4::identity();
         auto r2 = matrix4::identity();
+
+        // T265 pose rendering. Sets r1/r2 from the live pose so the camera model below is
+        // drawn at the tracked position, and draws the accumulated trajectory.
+        {
+            auto x = static_cast<float>(-M_PI / 2);
+            float _rx[4][4] = {
+                { 1 , 0, 0, 0 },
+                { 0, static_cast<float>(cos(x)), static_cast<float>(-sin(x)), 0 },
+                { 0, static_cast<float>(sin(x)), static_cast<float>(cos(x)), 0 },
+                { 0, 0, 0, 1 }
+            };
+            static const double z = M_PI;
+            static float _rz[4][4] = {
+                { float(cos(z)), float(-sin(z)),0, 0 },
+                { float(sin(z)), float(cos(z)), 0, 0 },
+                { 0 , 0, 1, 0 },
+                { 0, 0, 0, 1 }
+            };
+            rs2::matrix4 rx(_rx);
+            rs2::matrix4 rz(_rz);
+
+            for (auto&& stream : streams)
+            {
+                if (stream.second.profile.stream_type() != RS2_STREAM_POSE)
+                    continue;
+
+                auto f = stream.second.texture->get_last_frame();
+                if (!f || !f.is<pose_frame>())
+                    continue;
+
+                rs2_pose pose_data = f.as<pose_frame>().get_pose_data();
+
+                auto t = pose_to_world_transformation(pose_data);
+                float model[4][4];
+                t.to_column_major((float*)model);
+                auto m = model;
+
+                r1 = m * rx;
+                r2 = rz * m * rx;
+
+                // set the pose transformation as the model matrix to draw the trajectory
+                glMatrixMode(GL_MODELVIEW);
+                glPushMatrix();
+                glLoadMatrixf(view);
+                glMultMatrixf((float*)_rx);
+
+                auto dev = streams[f.get_profile().unique_id()].dev;
+                if (dev)
+                    dev->tm2.draw_trajectory(true);
+
+                // remove the model matrix from the rest of the render
+                glPopMatrix();
+            }
+        }
 
         if (draw_plane && !paused)
         {
@@ -2461,7 +2799,10 @@ namespace rs2
         ImGui::PushFont(window.get_large_font());
         ImGui::PushStyleColor(ImGuiCol_Border, black);
 
-        int buttons = window.is_fullscreen() ? 4 : 3;
+        // The re-arrange-tiles toggle always occupies a slot immediately to the left of the
+        // Settings button. It is enabled in 2D view and disabled (greyed out) in 3D view.
+        const int rearrange_slot = 1;
+        int buttons = (window.is_fullscreen() ? 4 : 3) + rearrange_slot;
 
         ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons));
         ImGui::PushStyleColor(ImGuiCol_Text, is_3d_view ? light_grey : light_blue);
@@ -2489,7 +2830,32 @@ namespace rs2
         ImGui::PopStyleColor(2);
         ImGui::SameLine();
 
-        ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons - 2));
+        // Re-arrange tiles toggle, placed next to the Settings button. Disabled in 3D view.
+        {
+            ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons - 2));
+            ImGui::BeginDisabled(is_3d_view);
+            ImGui::PushStyleColor(ImGuiCol_Text, allow_streams_reorder ? light_blue : light_grey);
+            ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, allow_streams_reorder ? light_blue : light_grey);
+            if (ImGui::Button(textual_icons::up_down_left_right, { panel_y, panel_y }))
+            {
+                allow_streams_reorder = !allow_streams_reorder;
+            }
+            ImGui::PopStyleColor(2);
+            ImGui::EndDisabled();
+            if (!is_3d_view && ImGui::IsItemHovered())
+            {
+                // Match the Settings tooltip font (base font, not the large toolbar font)
+                ImGui::PushFont(window.get_font());
+                RsImGui::CustomTooltip("%s", allow_streams_reorder
+                    ? "Re-arrange tiles: ON - drag a stream tile onto another to swap them.\nArrangement is saved per camera."
+                    : "Re-arrange tiles - drag stream tiles to swap their positions.\nArrangement is saved per camera.");
+                ImGui::PopFont();
+                window.link_hovered();
+            }
+            ImGui::SameLine();
+        }
+
+        ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons - 2 - rearrange_slot));
 
         static bool settings_open = false;
         ImGui::PushStyleColor(ImGuiCol_Text, !settings_open ? light_grey : light_blue);
@@ -2508,7 +2874,7 @@ namespace rs2
         if (window.is_fullscreen())
         {
             ImGui::SameLine();
-            ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons - 4));
+            ImGui::SetCursorPosX(window.width() - panel_width - panel_y * (buttons - 4 - rearrange_slot));
 
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, button_color);
             ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
@@ -3584,39 +3950,6 @@ namespace rs2
         return rs2::rect{ dst_tl[0], dst_tl[1], dst_br[0] - dst_tl[0], dst_br[1] - dst_tl[1] }.intersection( depth_frame_rect );
     }
 
-    float viewer_model::sample_mean_depth( const rs2::depth_frame & df, const rs2::rect & depth_bbox )
-    {
-        uint16_t const * const depth_data   = reinterpret_cast< uint16_t const * >( df.get_data() );
-        float const            depth_scale  = df.get_units();
-        int const              depth_width  = df.get_width();
-        int const              depth_height = df.get_height();
-        int const cx = int( depth_bbox.x + depth_bbox.w * 0.5f );
-        int const cy = int( depth_bbox.y + depth_bbox.h * 0.5f );
-        static const int offsets[][2] = { { -2, -2 }, {  0, -2 }, {  2, -2 },
-                                          { -2,  0 }, {  0,  0 }, {  2,  0 },
-                                          { -2,  2 }, {  0,  2 }, {  2,  2 } };
-        float total = 0.f;
-        int hits = 0;
-        for( auto const & off : offsets )
-        {
-            int const x = cx + off[0];
-            int const y = cy + off[1];
-            if( x < 0 || x >= depth_width || y < 0 || y >= depth_height )
-                continue;
-            uint16_t const d = depth_data[y * depth_width + x];
-            if( d != 0 )
-            {
-                total += d * depth_scale;
-                ++hits;
-            }
-        }
-
-        float val = hits > 0 ? total / hits : 0.f;
-        if( val > 5.0f ) // Above 5 meters not accurate, prefer to not show.
-            val = 0.f;
-        return val;
-    }
-
     void viewer_model::process_object_detection_frames( std::map< int, rs2::frame > & last_frames )
     {
         // Scan last_frames for an object detection frame, a color frame, and a depth frame.
@@ -3653,8 +3986,26 @@ namespace rs2
         if( ! objects )
             return;
 
-        // Require both color and depth; clear detections if either is absent
-        if( ! odf || ! cf || ! df || odf.get_detection_count() == 0 )
+        // No OD frame this tick. When OD fps < render fps this is normal (e.g. OD@15fps, RGB@30fps).
+        // Keep last known detections to avoid flicker, but clear if absent for too long (OD sensor stopped).
+        static constexpr int MAX_STALE_OD_TICKS = 3;
+        if( ! odf )
+        {
+            if( ++objects->ticks_without_od_frame > MAX_STALE_OD_TICKS )
+            {
+                std::lock_guard< std::mutex > lock( objects->mutex );
+                objects->clear();
+            }
+            return;
+        }
+        objects->ticks_without_od_frame = 0;
+
+        // OD frame arrived but depth not yet available — skip without clearing
+        if( ! df )
+            return;
+
+        // Fresh OD frame with no detections — clear
+        if( odf.get_detection_count() == 0 )
         {
             std::lock_guard< std::mutex > lock( objects->mutex );
             objects->clear();
@@ -3674,15 +4025,52 @@ namespace rs2
             rs2::rect color_frame_rect{ 0.f, 0.f, float( color_intrin.width ), float( color_intrin.height ) };
             rs2::rect depth_frame_rect{ 0.f, 0.f, float( depth_intrin.width ), float( depth_intrin.height ) };
 
-            uint16_t const * const depth_data  = reinterpret_cast< uint16_t const * >( df.get_data() );
-            float const            depth_scale = df.get_units();
+            uint16_t const * const depth_data = reinterpret_cast< uint16_t const * >( df.get_data() );
+
+            com::depth_image_16 com_raw{ depth_data, depth_intrin.width, depth_intrin.height };
+            std::vector< uint8_t > depth8u_buf( depth_intrin.width * depth_intrin.height );
+            com::depth_image_8 com_depth8u{ depth8u_buf.data(), depth_intrin.width, depth_intrin.height };
+            bool depth8u_ready = false;
 
             objects_in_frame new_objects;
             unsigned int const count = odf.get_detection_count();
 
+            // Non-maximum suppression: sort by score, suppress overlapping same-class boxes
+            static constexpr float NMS_IOU_THRESHOLD   = 0.55f;
+            static constexpr int   NMS_SCORE_THRESHOLD = 45;
+            std::vector< rs2_object_detection > raw_dets( count );
             for( unsigned int i = 0; i < count; ++i )
+                raw_dets[i] = odf.get_detection( i );
+            std::sort( raw_dets.begin(), raw_dets.end(),
+                []( const rs2_object_detection & a, const rs2_object_detection & b ) { return a.score > b.score; } );
+            std::vector< bool > suppressed( count, false );
+            for( size_t i = 0; i < count; ++i )
+                if( raw_dets[i].score < NMS_SCORE_THRESHOLD )
+                    suppressed[i] = true;
+            for( size_t i = 0; i < count; ++i )
             {
-                rs2_object_detection det = odf.get_detection( i );
+                if( suppressed[i] ) continue;
+                rs2::rect bi{ float( raw_dets[i].top_left_x ), float( raw_dets[i].top_left_y ),
+                              float( raw_dets[i].bottom_right_x - raw_dets[i].top_left_x ),
+                              float( raw_dets[i].bottom_right_y - raw_dets[i].top_left_y ) };
+                for( size_t j = i + 1; j < count; ++j )
+                {
+                    if( suppressed[j] || raw_dets[j].class_id != raw_dets[i].class_id ) continue;
+                    rs2::rect bj{ float( raw_dets[j].top_left_x ), float( raw_dets[j].top_left_y ),
+                                  float( raw_dets[j].bottom_right_x - raw_dets[j].top_left_x ),
+                                  float( raw_dets[j].bottom_right_y - raw_dets[j].top_left_y ) };
+                    float inter_area = bi.intersection( bj ).area();
+                    float union_area = bi.area() + bj.area() - inter_area;
+                    if( union_area > 0.f && inter_area / union_area > NMS_IOU_THRESHOLD )
+                        suppressed[j] = true;
+                }
+            }
+
+            size_t obj_id = 0;
+            for( size_t i = 0; i < count; ++i )
+            {
+                if( suppressed[i] ) continue;
+                rs2_object_detection const & det = raw_dets[i];
 
                 // Pixel-coordinate bounding box in the color frame
                 rs2::rect color_bbox{ float( det.top_left_x ),
@@ -3691,16 +4079,85 @@ namespace rs2
                                       float( det.bottom_right_y - det.top_left_y ) };
                 rs2::rect normalized_color_bbox = color_bbox.normalize( color_frame_rect );
 
-                rs2::rect depth_bbox = project_color_bbox_to_depth( color_bbox, depth_data, depth_scale,
-                                                                    depth_intrin, color_intrin,
-                                                                    color_to_depth, depth_to_color, depth_frame_rect );
+                // depth_bbox_full: simple resolution scaling of the color bbox.
+                // COM runs within this region for a stable, deterministic depth measurement.
+                // The depth-view dot position is corrected for sensor parallax separately
+                // by projecting the single COM pixel through rs2_project_color_pixel_to_depth_pixel.
+                float const depth_scale_x = float( depth_intrin.width  ) / float( color_intrin.width  );
+                float const depth_scale_y = float( depth_intrin.height ) / float( color_intrin.height );
+                // depth_bbox_full: unclipped scaled bbox — used for com_rel_u/v normalization.
+                // Clipping only affects the actual ROI sampled.
+                rs2::rect depth_bbox_full{
+                    color_bbox.x * depth_scale_x, color_bbox.y * depth_scale_y,
+                    color_bbox.w * depth_scale_x, color_bbox.h * depth_scale_y };
+                rs2::rect depth_bbox = depth_bbox_full.intersection( depth_frame_rect );
                 rs2::rect normalized_depth_bbox = depth_bbox.normalize( depth_frame_rect );
 
-                // Currently detection depth is not calculated in device, later we will use detection depth data.
-                float const mean_depth = sample_mean_depth( df, depth_bbox );
+                float const hkr_depth_m = det.depth;
+                float viewer_depth_m = 0.f;
+                float com_rel_u = 0.5f, com_rel_v = 0.5f;
+
+                // TODO: temporary fallback — viewer-side COM runs only when HKR firmware
+                // returns 0 (XU command not supported or device not ready).
+                // Checked per-detection intentionally: firmware could return 0 for individual
+                // detections (e.g. out-of-range) even when HKR COM is otherwise working.
+                // Remove once HKR COM is fully implemented and reliable on all devices.
+                if( hkr_depth_m == 0.f )
+                {
+                    if( !depth8u_ready )
+                    {
+                        com::center_of_mass_calculator::create_depth_8u( com_raw, com_depth8u );
+                        depth8u_ready = true;
+                    }
+                    int const com_x = (int)depth_bbox.x;
+                    int const com_y = (int)depth_bbox.y;
+                    com::rect  com_bbox{ com_x, com_y,
+                                         (int)( depth_bbox.x + depth_bbox.w + 0.5f ) - com_x,
+                                         (int)( depth_bbox.y + depth_bbox.h + 0.5f ) - com_y };
+                    com::vec2f com_center{ depth_bbox.x + depth_bbox.w * 0.5f,
+                                           depth_bbox.y + depth_bbox.h * 0.5f };
+                    com::camera_intrinsics com_intrin{ depth_intrin.fx, depth_intrin.fy,
+                                                       depth_intrin.ppx, depth_intrin.ppy };
+                    // Project bbox center from color space to raw-depth space to get
+                    // the stereo-baseline pixel shift; keep {0,0} if no depth at bbox center.
+                    float shift_x = 0.f, shift_y = 0.f;
+                    float center_px[2] = { color_bbox.x + color_bbox.w * 0.5f,
+                                           color_bbox.y + color_bbox.h * 0.5f };
+                    float const depth_units = df.get_units();
+                    float depth_px[2]  = { -1.f, -1.f };
+                    rs2_project_color_pixel_to_depth_pixel( depth_px, depth_data, depth_units, 0.1f, 10.f,
+                        &depth_intrin, &color_intrin, &color_to_depth, &depth_to_color, center_px );
+                    if( depth_px[0] >= 0.f && depth_px[0] < float( depth_intrin.width ) &&
+                        depth_px[1] >= 0.f && depth_px[1] < float( depth_intrin.height ) )
+                    {
+                        uint16_t center_raw = depth_data[(int)depth_px[1] * depth_intrin.width + (int)depth_px[0]];
+                        float const center_m = center_raw * depth_units;
+                        if( center_m > 0.4f && center_m < 8.0f )
+                        {
+                            shift_x = depth_px[0] - center_px[0] * depth_scale_x;
+                            shift_y = depth_px[1] - center_px[1] * depth_scale_y;
+                        }
+                    }
+                    com::person_center_of_mass com_result{};
+                    com::center_of_mass_calculator::calculate( com_raw, com_depth8u, com_bbox, com_center,
+                                                               &com_intrin, com_result, { shift_x, shift_y } );
+                    if( com_result.mean_body_depth > 0.f )
+                    {
+                        viewer_depth_m = com_result.mean_body_depth / 1000.f;
+                        auto clamp01 = []( float v ) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; };
+                        if( depth_bbox_full.w > 0.f && depth_bbox_full.h > 0.f )
+                        {
+                            com_rel_u = clamp01( ( com_result.image_pos.x - depth_bbox_full.x ) / depth_bbox_full.w );
+                            com_rel_v = clamp01( ( com_result.image_pos.y - depth_bbox_full.y ) / depth_bbox_full.h );
+                        }
+                    }
+                }
+
+                float const mean_depth = hkr_depth_m > 0.f ? hkr_depth_m : viewer_depth_m;
 
                 std::string name = object_type_to_string( static_cast< object_type >( det.class_id ) );
-                new_objects.emplace_back( size_t( i ), name, normalized_color_bbox, normalized_depth_bbox, mean_depth,
+                new_objects.emplace_back( obj_id++, name, normalized_color_bbox, normalized_depth_bbox, mean_depth,
+                                          hkr_depth_m, com_rel_u, com_rel_v, det.score,
                                           static_cast< object_type >( det.class_id ) );
             }
 

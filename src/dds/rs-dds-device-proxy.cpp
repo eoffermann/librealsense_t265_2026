@@ -694,8 +694,8 @@ void dds_device_proxy::tag_profiles( stream_profiles profiles ) const
 void dds_device_proxy::hardware_reset()
 {
     json control = json::object( { { realdds::topics::control::key::id, realdds::topics::control::hw_reset::id } } );
-    json reply;
-    _dds_dev->send_control( control, &reply );
+    // don't wait for a reply - the device may reset before the reply is delivered
+    _dds_dev->send_control( control );
 }
 
 bool dds_device_proxy::is_in_recovery_mode() const

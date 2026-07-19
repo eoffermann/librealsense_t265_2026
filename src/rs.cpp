@@ -40,6 +40,7 @@
 #include "proc/sequence-id-filter.h"
 #include "proc/decimation-embedded-filter.h"
 #include "proc/temporal-embedded-filter.h"
+#include "proc/close-range-embedded-filter.h"
 #include "media/playback/playback_device.h"
 #include "stream.h"
 #include <librealsense2/h/rs_types.h>
@@ -1956,7 +1957,7 @@ int rs2_is_sensor_extendable_to(const rs2_sensor* sensor, rs2_extension extensio
     case RS2_EXTENSION_SOFTWARE_SENSOR         : return VALIDATE_INTERFACE_NO_THROW(sensor->sensor, librealsense::software_sensor)        != nullptr;
     case RS2_EXTENSION_POSE_SENSOR             : return VALIDATE_INTERFACE_NO_THROW(sensor->sensor, librealsense::pose_sensor_interface)  != nullptr;
     case RS2_EXTENSION_WHEEL_ODOMETER          : return VALIDATE_INTERFACE_NO_THROW(sensor->sensor, librealsense::wheel_odometry_interface)!= nullptr;
-    case RS2_EXTENSION_TM2_SENSOR              : return false;
+    case RS2_EXTENSION_TM2_SENSOR              : return VALIDATE_INTERFACE_NO_THROW(sensor->sensor, librealsense::tm2_sensor_interface) != nullptr;
     case RS2_EXTENSION_COLOR_SENSOR            : return VALIDATE_INTERFACE_NO_THROW(sensor->sensor, librealsense::color_sensor)           != nullptr;
     case RS2_EXTENSION_MOTION_SENSOR           : return VALIDATE_INTERFACE_NO_THROW(sensor->sensor, librealsense::motion_sensor)          != nullptr;
     case RS2_EXTENSION_FISHEYE_SENSOR          : return VALIDATE_INTERFACE_NO_THROW(sensor->sensor, librealsense::fisheye_sensor)         != nullptr;
@@ -1997,7 +1998,7 @@ int rs2_is_device_extendable_to(const rs2_device* dev, rs2_extension extension, 
         case RS2_EXTENSION_OBJECT_DETECTION_SENSOR: return VALIDATE_INTERFACE_NO_THROW(dev->device, librealsense::object_detection_sensor)      != nullptr;
         case RS2_EXTENSION_RECORD                : return VALIDATE_INTERFACE_NO_THROW(dev->device, librealsense::record_device)                 != nullptr;
         case RS2_EXTENSION_PLAYBACK              : return VALIDATE_INTERFACE_NO_THROW(dev->device, librealsense::playback_device)               != nullptr;
-        case RS2_EXTENSION_TM2                   : return false;
+        case RS2_EXTENSION_TM2                   : return VALIDATE_INTERFACE_NO_THROW(dev->device, librealsense::tm2_extensions)              != nullptr;
         case RS2_EXTENSION_UPDATABLE             : return VALIDATE_INTERFACE_NO_THROW(dev->device, librealsense::updatable)                     != nullptr;
         case RS2_EXTENSION_UPDATE_DEVICE         : return VALIDATE_INTERFACE_NO_THROW(dev->device, librealsense::update_device_interface)       != nullptr;
         case RS2_EXTENSION_GLOBAL_TIMER          : return VALIDATE_INTERFACE_NO_THROW(dev->device, librealsense::global_time_interface)         != nullptr;
@@ -2070,6 +2071,7 @@ int rs2_is_embedded_filter_extendable_to(const rs2_embedded_filter* embedded_fil
     {
     case RS2_EXTENSION_DECIMATION_EMBEDDED_FILTER: return VALIDATE_INTERFACE_NO_THROW((embedded_filter_interface*)(embedded_filter->_embedded_filter.get()), librealsense::decimation_embedded_filter) != nullptr;
     case RS2_EXTENSION_TEMPORAL_EMBEDDED_FILTER: return VALIDATE_INTERFACE_NO_THROW((embedded_filter_interface*)(embedded_filter->_embedded_filter.get()), librealsense::temporal_embedded_filter) != nullptr;
+    case RS2_EXTENSION_CLOSE_RANGE_EMBEDDED_FILTER: return VALIDATE_INTERFACE_NO_THROW((embedded_filter_interface*)(embedded_filter->_embedded_filter.get()), librealsense::close_range_embedded_filter) != nullptr;
     default:
         return false;
     }
@@ -3421,31 +3423,48 @@ HANDLE_EXCEPTIONS_AND_RETURN(, severity, message)
 
 void rs2_loopback_enable(const rs2_device* device, const char* from_file, rs2_error** error) BEGIN_API_CALL
 {
-    throw not_implemented_exception( "deprecated" );
+    VALIDATE_NOT_NULL(device);
+    VALIDATE_NOT_NULL(from_file);
+
+    auto loopback = VALIDATE_INTERFACE(device->device, librealsense::tm2_extensions);
+    loopback->enable_loopback(from_file);
 }
 HANDLE_EXCEPTIONS_AND_RETURN(, device, from_file)
 
 void rs2_loopback_disable(const rs2_device* device, rs2_error** error) BEGIN_API_CALL
 {
-    throw not_implemented_exception( "deprecated" );
+    VALIDATE_NOT_NULL(device);
+
+    auto loopback = VALIDATE_INTERFACE(device->device, librealsense::tm2_extensions);
+    loopback->disable_loopback();
 }
 HANDLE_EXCEPTIONS_AND_RETURN(, device)
 
 int rs2_loopback_is_enabled(const rs2_device* device, rs2_error** error) BEGIN_API_CALL
 {
-    throw not_implemented_exception( "deprecated" );
+    VALIDATE_NOT_NULL(device);
+
+    auto loopback = VALIDATE_INTERFACE(device->device, librealsense::tm2_extensions);
+    return loopback->is_enabled() ? 1 : 0;
 }
 HANDLE_EXCEPTIONS_AND_RETURN(0, device)
 
 void rs2_connect_tm2_controller(const rs2_device* device, const unsigned char* mac, rs2_error** error) BEGIN_API_CALL
 {
-    throw not_implemented_exception( "deprecated" );
+    VALIDATE_NOT_NULL(device);
+    VALIDATE_NOT_NULL(mac);
+
+    auto tm2 = VALIDATE_INTERFACE(device->device, librealsense::tm2_extensions);
+    tm2->connect_controller({ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] });
 }
 HANDLE_EXCEPTIONS_AND_RETURN(, device)
 
 void rs2_disconnect_tm2_controller(const rs2_device* device, int id, rs2_error** error) BEGIN_API_CALL
 {
-    throw not_implemented_exception( "deprecated" );
+    VALIDATE_NOT_NULL(device);
+
+    auto tm2 = VALIDATE_INTERFACE(device->device, librealsense::tm2_extensions);
+    tm2->disconnect_controller(id);
 }
 HANDLE_EXCEPTIONS_AND_RETURN(, device)
 
@@ -3823,6 +3842,20 @@ int rs2_check_firmware_compatibility(const rs2_device* device, const void* fw_im
     return res ? 1 : 0;
 }
 HANDLE_EXCEPTIONS_AND_RETURN(0, fw_image, device)
+
+const char* rs2_get_firmware_min_version(const rs2_device* device, rs2_error** error) BEGIN_API_CALL
+{
+    VALIDATE_NOT_NULL(device);
+
+    auto fwud = std::dynamic_pointer_cast< firmware_check_interface >( device->device );
+    if( ! fwud )
+        throw std::runtime_error("This device does not support update protocol!");
+
+    thread_local std::string min_version;
+    min_version = fwud->get_firmware_min_version();
+    return min_version.c_str();
+}
+HANDLE_EXCEPTIONS_AND_RETURN(nullptr, device)
 
 void rs2_enter_update_state(const rs2_device* device, rs2_error** error) BEGIN_API_CALL
 {

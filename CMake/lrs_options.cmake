@@ -8,6 +8,9 @@ option(ENABLE_CCACHE "Build with ccache." ON)
 option(BUILD_WITH_CUDA "Enable CUDA" OFF)
 option(BUILD_GLSL_EXTENSIONS "Build GLSL extensions API" ON)
 option(BUILD_WITH_OPENMP "Use OpenMP" OFF)
+# Historically defaulted ON, but the T265 driver is mid-port: enabling this today builds only
+# the enumeration layer, and the device cannot yet be opened. Default OFF until Phase 3 lands.
+option(BUILD_WITH_TM2 "Build with support for Intel T265 (TM2) tracking device -- IN PROGRESS" OFF)
 option(BUILD_EASYLOGGINGPP "Build EasyLogging++ as a part of the build" ON)
 option(BUILD_WITH_STATIC_CRT "Build with static link CRT" ON)
 option(HWM_OVER_XU "Send HWM commands over UVC XU control" ON)

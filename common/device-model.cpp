@@ -22,6 +22,7 @@
 #include "d500-on-chip-calib.h"
 #include "subdevice-model.h"
 #include "device-model.h"
+#include "model-views.h"  // bytes_from_bin_file / bin_file_from_bytes, used by the T265 localization map UI
 
 using namespace rs400;
 using rsutils::json;
@@ -29,6 +30,16 @@ using namespace rs2::sw_update;
 
 namespace rs2
 {
+    // RAII guard pairing BeginDisabled/EndDisabled: keeps them balanced even if an exception is
+    // thrown between begin and the explicit end() call (which runs before the tooltip hover check).
+    struct disable_guard
+    {
+        bool active, ended;
+        disable_guard( bool a ) : active( a ), ended( false ) { if( active ) ImGui::BeginDisabled( true ); }
+        void end() { if( active && !ended ) { ended = true; ImGui::EndDisabled(); } }
+        ~disable_guard() { end(); }
+    };
+
     void imgui_easy_theming(ImFont*& font_dynamic, ImFont*& font_18, ImFont*& monofont, int& font_size)
     {
         ImGuiStyle& style = ImGui::GetStyle();
@@ -124,11 +135,9 @@ namespace rs2
     {
         std::stringstream ss;
 
-        rs2_error* e = nullptr;
-
         ss << "| | |\n";
         ss << "|---|---|\n";
-        ss << "|**librealsense**|" << api_version_to_string(rs2_get_api_version(&e)) << (is_debug() ? " DEBUG" : " RELEASE") << "|\n";
+        ss << "|**librealsense**|" << RS2_API_FULL_VERSION_STR << (is_debug() ? " DEBUG" : " RELEASE") << "|\n";
         ss << "|**OS**|" << rsutils::os::get_os_name() << "|\n";
 
         for (auto& dm : devices)
@@ -318,7 +327,7 @@ namespace rs2
         {
             std::string name = dev.get_info(RS2_CAMERA_INFO_NAME);
             std::smatch match;
-            if( ! std::regex_search( name, match, std::regex( "^Intel RealSense (\\S+)" ) ) )
+            if( ! std::regex_search( name, match, std::regex( "^RealSense (\\S+)" ) ) )
                 throw std::runtime_error( "cannot parse device name from '" + name + "'" );
 
             glob(
@@ -335,7 +344,7 @@ namespace rs2
         }
     }
 
-    bool device_model::subdevice_has_inference_stream_enabled( const subdevice_model & sub )
+    bool device_model::subdevice_has_inference_stream_enabled( const subdevice_model & sub ) const
     {
         for( auto const & kv : sub.stream_enabled )
         {
@@ -373,6 +382,27 @@ namespace rs2
             if( sub->streaming && subdevice_has_inference_stream_enabled( *sub ) )
                 sub->stop( viewer.not_model );
         }
+    }
+
+    bool device_model::is_inference_streaming() const
+    {
+        for( auto const & sub : subdevices )
+            if( sub->streaming && subdevice_has_inference_stream_enabled( *sub ) )
+                return true;
+        return false;
+    }
+
+    bool device_model::is_inference_blocking_filter_enabled() const
+    {
+        for( auto const & sub : subdevices )
+            for( auto const & ef : sub->embedded_filters )
+            {
+                auto type = ef->get_filter()->get_type();
+                if( ( type == RS2_EMBEDDED_FILTER_TYPE_DECIMATION || type == RS2_EMBEDDED_FILTER_TYPE_TEMPORAL )
+                    && ef->is_enabled() )
+                    return true;
+            }
+        return false;
     }
 
     void device_model::play_defaults(viewer_model& viewer)
@@ -1274,6 +1304,88 @@ namespace rs2
             bool something_to_show = false;
             ImGui::PushStyleColor(ImGuiCol_Text, dark_grey);
 
+            if (auto tm2_extensions = dev.as<rs2::tm2>())
+            {
+                something_to_show = true;
+                try
+                {
+                    if (!tm2_extensions.is_loopback_enabled() && ImGui::Selectable("Enable loopback...", false, is_streaming ? ImGuiSelectableFlags_Disabled : 0))
+                    {
+                        if (const char* ret = file_dialog_open(file_dialog_mode::open_file, "ROS-bag\0*.bag\0", NULL, NULL))
+                        {
+                            tm2_extensions.enable_loopback(ret);
+                        }
+                    }
+                    if (tm2_extensions.is_loopback_enabled() && ImGui::Selectable("Disable loopback...", false, is_streaming ? ImGuiSelectableFlags_Disabled : 0))
+                    {
+                        tm2_extensions.disable_loopback();
+                    }
+                    if (ImGui::IsItemHovered())
+                    {
+                        if (is_streaming)
+                            ImGui::SetTooltip("Stop streaming to use loopback functionality");
+                        else
+                            ImGui::SetTooltip("Enter the device to loopback mode (inject frames from file to FW)");
+                    }
+
+                    if (auto tm_sensor = dev.first<pose_sensor>())
+                    {
+                        if (ImGui::Selectable("Export Localization map"))
+                        {
+                            if (auto target_path = file_dialog_open(save_file, "Tracking device Localization map (RAW)\0*.map\0", NULL, NULL))
+                            {
+                                error_message = safe_call([&]()
+                                {
+                                    std::stringstream ss;
+                                    ss << "Exporting localization map to " << target_path << " ... ";
+                                    viewer.not_model->add_log(ss.str());
+                                    bin_file_from_bytes(target_path, tm_sensor.export_localization_map());
+                                    ss.clear();
+                                    ss << "completed";
+                                    viewer.not_model->add_log(ss.str());
+                                });
+                            }
+                        }
+
+                        if (ImGui::IsItemHovered())
+                        {
+                            ImGui::SetTooltip("Retrieve the localization map from device");
+                        }
+
+                        if (ImGui::Selectable("Import Localization map", false, is_streaming ? ImGuiSelectableFlags_Disabled : 0))
+                        {
+                            if (auto source_path = file_dialog_open(open_file, "Tracking device Localization map (RAW)\0*.map\0", NULL, NULL))
+                            {
+                                error_message = safe_call([&]()
+                                {
+                                    std::stringstream ss;
+                                    ss << "Importing localization map from " << source_path << " ... ";
+                                    tm_sensor.import_localization_map(bytes_from_bin_file(source_path));
+                                    ss << "completed";
+                                    viewer.not_model->add_log(ss.str());
+                                });
+                            }
+                        }
+
+                        if (ImGui::IsItemHovered())
+                        {
+                            if (is_streaming)
+                                ImGui::SetTooltip("Stop streaming to Import localization map");
+                            else
+                                ImGui::SetTooltip("Load localization map from host to device");
+                        }
+                    }
+                }
+                catch (const rs2::error& e)
+                {
+                    error_message = error_to_string(e);
+                }
+                catch (const std::exception& e)
+                {
+                    error_message = e.what();
+                }
+            }
+
             if (_allow_remove)
             {
                 something_to_show = true;
@@ -1305,6 +1417,65 @@ namespace rs2
                     catch (const std::exception& e)
                     {
                         error_message = e.what();
+                    }
+                }
+
+                // PID toggle between Dual-RGB (2C) and Dedicated-RGB (3C) variants:
+                //   D535:       0x0C01 <-> 0x0C02
+                //   D585:       0x0C04 <-> 0x0C05
+                //   D585 Proto: 0x0C07 <-> 0x0C08
+                if (dev.supports(RS2_CAMERA_INFO_PRODUCT_ID) && dev.is<debug_protocol>())
+                {
+                    static constexpr uint32_t MWD_OPCODE          = 0x02U;
+                    static constexpr uint32_t MODE_REG_START_ADDR = 0x80000064U;
+                    static constexpr uint32_t MODE_REG_END_ADDR   = 0x80000068U;
+                    static constexpr uint32_t MODE_DEDICATED_RGB  = 0U;
+                    static constexpr uint32_t MODE_DUAL_RGB       = 1U;
+
+                    std::string current_pid = dev.get_info(RS2_CAMERA_INFO_PRODUCT_ID);
+                    const bool is_dual_rgb      = (current_pid == "0C01") || (current_pid == "0C04") || (current_pid == "0C07");
+                    const bool is_dedicated_rgb = (current_pid == "0C02") || (current_pid == "0C05") || (current_pid == "0C08");
+                    if (is_dual_rgb || is_dedicated_rgb)
+                    {
+                        const std::string toggle_label = is_dual_rgb
+                            ? "Switch to Dedicated-RGB Mode"
+                            : "Switch to Dual-RGB Mode";
+                        const ImGuiSelectableFlags toggle_flags = is_streaming
+                            ? ImGuiSelectableFlags_Disabled : ImGuiSelectableFlags_None;
+                        if (ImGui::Selectable(toggle_label.c_str(), false, toggle_flags))
+                        {
+                            try
+                            {
+                                const uint32_t value = is_dual_rgb ? MODE_DEDICATED_RGB : MODE_DUAL_RGB;
+                                const std::vector<uint8_t> data = {
+                                    static_cast<uint8_t>( value         & 0xFF),
+                                    static_cast<uint8_t>((value >>  8 ) & 0xFF),
+                                    static_cast<uint8_t>((value >> 16 ) & 0xFF),
+                                    static_cast<uint8_t>((value >> 24 ) & 0xFF) };
+
+                                auto dp = dev.as<debug_protocol>();
+                                auto cmd = dp.build_command(MWD_OPCODE, MODE_REG_START_ADDR, MODE_REG_END_ADDR, 0, 0, data);
+
+                                dp.send_and_receive_raw_data(cmd);
+                                restarting_device_info = get_device_info(dev, false);
+                                dev.hardware_reset();
+                            }
+                            catch (const error& e)
+                            {
+                                error_message = error_to_string(e);
+                            }
+                            catch (const std::exception& e)
+                            {
+                                error_message = e.what();
+                            }
+                        }
+                        if (ImGui::IsItemHovered())
+                        {
+                            std::string tooltip = rsutils::string::from()
+                                << "Switch Dual-RGB / Dedicated Color Sensor Mode"
+                                << (is_streaming ? " (Disabled while streaming)" : "");
+                            RsImGui::CustomTooltip("%s", tooltip.c_str());
+                        }
                     }
                 }
 
@@ -1973,7 +2144,8 @@ namespace rs2
                                             << "Setting " << opt_model.opt << " to " << new_val << " ("
                                             << labels[selected] << ")");
 
-                                        opt_model.set_option(opt_model.opt, static_cast<float>(new_val), error_message);
+                                        // Sync: get_curr_advanced_controls below reads back the FW state set by the preset.
+                                        opt_model.set_option_sync(static_cast<float>(new_val));
 
                                         // Only apply preset to GUI if set_option was succesful
                                         selected_file_preset = "";
@@ -2370,11 +2542,6 @@ namespace rs2
                 ImGui::SetCursorPos({ rc.x, rc.y + line_h });
             }
 
-            rc = ImGui::GetCursorPos();
-            ImGui::SetCursorPos({ rc.x + 12, rc.y + 4 });
-            std::string download_label = rsutils::string::from() << "Download firmware...##" << id;
-            hyperlink(window, download_label.c_str(), fw_download_url());
-
             ImGui::SetCursorPos({ rc.x + 225, rc.y - 107 });
             ImGui::PopFont();
         }
@@ -2455,8 +2622,11 @@ namespace rs2
                         }
                         if (can_stream)
                         {
-                            // Disable the start button for inference streams unless color and depth are already streaming.
-                            bool disable_inference = subdevice_has_inference_stream_enabled( *sub ) && ! are_color_and_depth_streaming();
+                            // Disable the start button for inference streams unless color and depth are already
+                            // streaming, and while a decimation/temporal embedded filter is enabled (mutually exclusive).
+                            bool sub_has_inference = subdevice_has_inference_stream_enabled( *sub );
+                            bool blocking_filter_enabled = sub_has_inference && is_inference_blocking_filter_enabled();
+                            bool disable_inference = ( sub_has_inference && ! are_color_and_depth_streaming() ) || blocking_filter_enabled;
                             if( disable_inference )
                                 ImGui::BeginDisabled();
 
@@ -2497,7 +2667,9 @@ namespace rs2
                             {
                                 ImGui::EndDisabled();
                                 if( ImGui::IsItemHovered( ImGuiHoveredFlags_AllowWhenDisabled ) )
-                                    RsImGui::CustomTooltip( "Color and Depth streams must be streaming before starting inference" );
+                                    RsImGui::CustomTooltip( blocking_filter_enabled
+                                        ? "Disable the decimation/temporal embedded filter before starting inference (cannot run together)"
+                                        : "Color and Depth streams must be streaming before starting inference" );
                             }
                             else if (ImGui::IsItemHovered())
                             {
@@ -2823,15 +2995,7 @@ namespace rs2
                         ImGui::SetCursorPos({ windows_width - 42, pos.y - 3 });
 
                         const bool pb_available = pb->is_available();
-                        // RAII guard pairing BeginDisabled/EndDisabled: keeps them balanced
-                        // even if an exception is thrown between begin and the explicit end()
-                        // call below (which runs before the tooltip hover check).
-                        struct disable_guard {
-                            bool active, ended;
-                            disable_guard( bool a ) : active( a ), ended( false ) { if( active ) ImGui::BeginDisabled( true ); }
-                            void end() { if( active && !ended ) { ended = true; ImGui::EndDisabled(); } }
-                            ~disable_guard() { end(); }
-                        } dg( !pb_available );
+                        disable_guard dg( !pb_available );
                         try
                         {
                             ImGui::PushFont(window.get_font());
@@ -2970,6 +3134,14 @@ namespace rs2
                     draw_later.push_back([windows_width, &window, sub, pos, &viewer, this, pb]() {
                         ImGui::SetCursorPos({ windows_width - 42, pos.y - 3 });
 
+                        const bool pb_available = pb->is_available();
+                        // Block turning a decimation/temporal filter on while inference streams (mutually exclusive).
+                        auto ef_type = pb->get_filter()->get_type();
+                        const bool block_enable_while_inference = !pb->is_enabled()
+                            && ( ef_type == RS2_EMBEDDED_FILTER_TYPE_DECIMATION
+                              || ef_type == RS2_EMBEDDED_FILTER_TYPE_TEMPORAL )
+                            && is_inference_streaming();
+                        disable_guard dg( !pb_available || block_enable_while_inference );
                         try
                         {
                             ImGui::PushFont(window.get_font());
@@ -3022,6 +3194,13 @@ namespace rs2
                                     window.link_hovered();
                                 }
                             }
+
+                            dg.end();
+                            if( !pb_available && !pb->unavailable_tooltip.empty()
+                                && ImGui::IsItemHovered( ImGuiHoveredFlags_AllowWhenDisabled ) )
+                                RsImGui::CustomTooltip( "%s", pb->unavailable_tooltip.c_str() );
+                            else if( block_enable_while_inference && ImGui::IsItemHovered( ImGuiHoveredFlags_AllowWhenDisabled ) )
+                                RsImGui::CustomTooltip( "Stop the inference stream before enabling this filter (cannot run together)" );
 
                             ImGui::PopStyleColor(5);
                             ImGui::PopFont();

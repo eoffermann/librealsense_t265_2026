@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { http, HttpResponse } from 'msw'
+import { server } from '../../mocks/server'
 import { useAppStore } from '@/store'
 import { resetStore, createMockDevice, createMockDeviceState, createMockSensor, createMockOption } from '../../utils/test-utils'
 
@@ -14,15 +16,14 @@ describe('AppStore', () => {
       expect(state.isConnected).toBe(false)
       expect(state.devices).toEqual([])
       expect(state.deviceStates).toEqual({})
-      expect(state.selectedDevice).toBeNull()
       expect(state.isLoadingDevices).toBe(false)
       expect(state.error).toBeNull()
     })
 
-    it('starts with grid view mode', () => {
+    it('starts in 2d view mode', () => {
       const state = useAppStore.getState()
-      
-      expect(state.viewMode).toBe('grid')
+
+      expect(state.viewMode).toBe('2d')
     })
 
     it('starts with chat closed', () => {
@@ -53,43 +54,18 @@ describe('AppStore', () => {
     })
   })
 
-  describe('Device Selection', () => {
-    it('selects a device', () => {
-      const device = createMockDevice()
-      
-      useAppStore.getState().selectDevice(device)
-      
-      expect(useAppStore.getState().selectedDevice).toEqual(device)
-    })
-
-    it('clears device selection', () => {
-      const device = createMockDevice()
-      useAppStore.getState().selectDevice(device)
-      
-      useAppStore.getState().selectDevice(null)
-      
-      expect(useAppStore.getState().selectedDevice).toBeNull()
-    })
-  })
-
   describe('View Mode', () => {
-    it('sets view mode to single', () => {
-      useAppStore.getState().setViewMode('single')
-      
-      expect(useAppStore.getState().viewMode).toBe('single')
+    it('switches to 3d', async () => {
+      await useAppStore.getState().setViewMode('3d')
+
+      expect(useAppStore.getState().viewMode).toBe('3d')
     })
 
-    it('sets view mode to pointcloud', () => {
-      useAppStore.getState().setViewMode('pointcloud')
-      
-      expect(useAppStore.getState().viewMode).toBe('pointcloud')
-    })
+    it('switches back to 2d', async () => {
+      await useAppStore.getState().setViewMode('3d')
+      await useAppStore.getState().setViewMode('2d')
 
-    it('sets view mode to grid', () => {
-      useAppStore.getState().setViewMode('single')
-      useAppStore.getState().setViewMode('grid')
-      
-      expect(useAppStore.getState().viewMode).toBe('grid')
+      expect(useAppStore.getState().viewMode).toBe('2d')
     })
   })
 
@@ -249,6 +225,36 @@ describe('AppStore', () => {
     })
   })
 
+  describe('fetchDevices', () => {
+    const presentDevice = createMockDevice({ device_id: 'present-1', serial_number: 'present-1' })
+    const goneDevice = createMockDevice({ device_id: 'gone-1', serial_number: 'gone-1' })
+
+    function mockDevicesEndpoint(list: ReturnType<typeof createMockDevice>[]) {
+      server.use(
+        http.get('/api/v1/devices/', () => HttpResponse.json(list))
+      )
+    }
+
+    it('guards against concurrent fetches', async () => {
+      let calls = 0
+      server.use(
+        http.get('/api/v1/devices/', async () => {
+          calls += 1
+          // Hold the response so the second call overlaps the first.
+          await new Promise((resolve) => setTimeout(resolve, 20))
+          return HttpResponse.json([presentDevice])
+        })
+      )
+
+      const first = useAppStore.getState().fetchDevices(true)
+      // Second call starts while the first is still in flight → must short-circuit.
+      const second = useAppStore.getState().fetchDevices(true)
+      await Promise.all([first, second])
+
+      expect(calls).toBe(1)
+    })
+  })
+
   describe('Stream Configuration', () => {
     it('can set stream configs directly via setState', () => {
       const device = createMockDevice()
@@ -276,46 +282,7 @@ describe('AppStore', () => {
     })
   })
 
-  describe('Legacy Compatibility Getters', () => {
-    it('sensors getter returns selected device sensors when set directly', () => {
-      const device = createMockDevice()
-      const sensor = createMockSensor()
-      const deviceState = createMockDeviceState(device, {
-        isActive: true,
-        sensors: [sensor],
-      })
-      
-      // Set the full state atomically
-      useAppStore.setState({
-        devices: [device],
-        deviceStates: { [device.device_id]: deviceState },
-        selectedDevice: device,
-      })
-      
-      const state = useAppStore.getState()
-      // Verify selectedDevice is set correctly
-      expect(state.selectedDevice?.device_id).toBe(device.device_id)
-      // Check sensors through the deviceStates directly since getter may have edge cases
-      expect(state.deviceStates[device.device_id].sensors).toContainEqual(sensor)
-    })
-
-    it('sensors getter returns empty array when no selected device', () => {
-      const device = createMockDevice()
-      const sensor = createMockSensor()
-      const deviceState = createMockDeviceState(device, {
-        isActive: true,
-        sensors: [sensor],
-      })
-      
-      useAppStore.setState({
-        devices: [device],
-        deviceStates: { [device.device_id]: deviceState },
-        selectedDevice: null,
-      })
-      
-      expect(useAppStore.getState().sensors).toEqual([])
-    })
-
+  describe('Aggregate Getters', () => {
     it('isStreaming reflects device streaming state', () => {
       const device = createMockDevice()
       const deviceState = createMockDeviceState(device, {

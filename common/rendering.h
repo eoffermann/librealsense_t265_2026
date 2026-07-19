@@ -11,7 +11,6 @@
 #include <librealsense2-gl/rs_processing_gl.hpp>
 #include <rsutils/time/stopwatch.h>
 #include <rsutils/string/from.h>
-#include <rsutils/number/byte-manipulation.h>
 
 #include "matrix4.h"
 #include "float3.h"
@@ -381,6 +380,10 @@ namespace rs2
         rsutils::time::stopwatch _t;
     };
 
+    // IMPORTANT: the destructor calls glDeleteTextures(), which requires a
+    // current OpenGL context. Owners must ensure a valid GL context is current
+    // at the point of destruction. See ux-window.cpp for the canonical pattern:
+    // an owned texture_buffer must be released *before* glfwDestroyWindow().
     class texture_buffer
     {
         GLuint texture;
@@ -396,15 +399,22 @@ namespace rs2
         rect curr_preview_rect{};
         int texture_id = 0;
 
-        texture_buffer(const texture_buffer& other)
-        {
-            texture = other.texture;
-        }
+        // Own the GL texture properly. Each Stop/Start cycle gc_streams destroys
+        // and recreates this object, so without a destructor the GL texture (and
+        // the driver-side allocation behind it) leaks every cycle.
+        // Copy/move deleted because shallow-copying `texture` would double-free.
+        texture_buffer( const texture_buffer & )             = delete;
+        texture_buffer & operator=( const texture_buffer & ) = delete;
+        texture_buffer( texture_buffer && )                  = delete;
+        texture_buffer & operator=( texture_buffer && )      = delete;
 
-        texture_buffer& operator=(const texture_buffer& other)
+        ~texture_buffer()
         {
-            texture = other.texture;
-            return *this;
+            if( texture )
+            {
+                glDeleteTextures( 1, &texture );
+                texture = 0;
+            }
         }
 
         rs2::frame get_last_frame(bool with_texture = false) const {

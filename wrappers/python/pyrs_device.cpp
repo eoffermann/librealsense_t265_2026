@@ -28,6 +28,7 @@ void init_device(py::module &m) {
         .def("first_motion_sensor", [](rs2::device& self) { return self.first<rs2::motion_sensor>(); }) // No docstring in C++
         .def("first_fisheye_sensor", [](rs2::device& self) { return self.first<rs2::fisheye_sensor>(); }) // No docstring in C++
         .def("first_safety_sensor", [](rs2::device& self) { return self.first<rs2::safety_sensor>(); }) // No docstring in C++
+        .def("first_inference_sensor", [](rs2::device& self) { return self.first<rs2::inference_sensor>(); }) // No docstring in C++
         .def("supports", &rs2::device::supports, "Check if specific camera info is supported.", "info"_a)
         .def("get_info", &rs2::device::get_info, "Retrieve camera specific information, "
              "like versions of various internal components", "info"_a)
@@ -38,6 +39,9 @@ void init_device(py::module &m) {
         .def("__bool__", &rs2::device::operator bool) // Called to implement truth value testing in Python 3
         .def( "is_connected", &rs2::device::is_connected )
         .def("is_in_recovery_mode", &rs2::device::is_in_recovery_mode)
+        .def("get_firmware_min_version", &rs2::device::get_firmware_min_version,
+             "Get the minimum firmware version supported by this device's SKU (e.g. \"5.10.0.17\"). "
+             "Throws if the device does not implement the FW-update protocol or has no defined minimum.")
         .def(BIND_DOWNCAST(device, debug_protocol))
         .def(BIND_DOWNCAST(device, playback))
         .def(BIND_DOWNCAST(device, recorder))
@@ -47,11 +51,12 @@ void init_device(py::module &m) {
         .def(BIND_DOWNCAST(device, device_calibration))
         .def(BIND_DOWNCAST(device, calibration_change_device))
         .def(BIND_DOWNCAST(device, firmware_logger))
+        .def(BIND_DOWNCAST(device, tm2))
         .def("__repr__", [](const rs2::device &self) {
             std::ostringstream ss;
             auto name = self.get_info( RS2_CAMERA_INFO_NAME );
-            if( 0 == strncmp( name, "Intel RealSense ", 16 ) )
-                name += 16;
+            if( 0 == strncmp( name, "RealSense ", 10 ) )
+                name += 10;
             ss << "<" SNAME ".device: " << name;
             if (self.supports(RS2_CAMERA_INFO_SERIAL_NUMBER))
                 ss << " (S/N: " << self.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER);
@@ -92,6 +97,13 @@ void init_device(py::module &m) {
 
             return rs2::metadata_helper::instance().is_enabled(id);
         });
+
+    m.def("enable_metadata", []() {
+        rs2::metadata_helper::instance().enable_metadata();
+    }, "Enable per-frame metadata at OS level for connected D400/D500 devices. "
+       "Windows: writes HKLM UVC registry keys; must be called from an admin process. "
+       "Throws RuntimeError on failure.",
+       py::call_guard<py::gil_scoped_release>());
 
     // not binding update_progress_callback, templated
 
@@ -303,6 +315,25 @@ void init_device(py::module &m) {
         })
         .def("front", &rs2::device_list::front) // No docstring in C++
         .def("back", &rs2::device_list::back); // No docstring in C++
+
+    py::class_<rs2::tm2, rs2::device> tm2(m, "tm2", "The tm2 class is an interface for T2XX devices, such as T265.
+"
+                                                    "For T265, it provides RS2_STREAM_FISHEYE(2), RS2_STREAM_GYRO, "
+                                                    "RS2_STREAM_ACCEL, and RS2_STREAM_POSE streams, and contains the following sensors:
+"
+                                                    "-pose_sensor: map and relocalization functions.
+"
+                                                    "-wheel_odometer: input for odometry data.");
+    tm2.def(py::init<rs2::device>(), "device"_a)
+        .def("enable_loopback", &rs2::tm2::enable_loopback, "Enter the given device into "
+             "loopback operation mode that uses the given file as input for raw data", "filename"_a)
+        .def("disable_loopback", &rs2::tm2::disable_loopback, "Restores the given device into normal operation mode")
+        .def("is_loopback_enabled", &rs2::tm2::is_loopback_enabled, "Checks if the device is in loopback mode or not")
+        .def("set_intrinsics", &rs2::tm2::set_intrinsics, "Set camera intrinsics", "sensor_id"_a, "intrinsics"_a)
+        .def("set_extrinsics", &rs2::tm2::set_extrinsics, "Set camera extrinsics", "from_stream"_a, "from_id"_a, "to_stream"_a, "to_id"_a, "extrinsics"_a)
+        .def("set_motion_device_intrinsics", &rs2::tm2::set_motion_device_intrinsics, "Set motion device intrinsics", "stream_type"_a, "motion_intrinsics"_a)
+        .def("reset_to_factory_calibration", &rs2::tm2::reset_to_factory_calibration, "Reset to factory calibration")
+        .def("write_calibration", &rs2::tm2::write_calibration, "Write calibration to device's EEPROM");
 
     /** end rs_device.hpp **/
 }

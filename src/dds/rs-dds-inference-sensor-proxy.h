@@ -12,7 +12,7 @@ namespace librealsense {
 // For cases when checking if this is< inference_sensor >
 class dds_inference_sensor_proxy
     : public dds_sensor_proxy
-    , public inference_sensor
+    , public virtual inference_sensor
 {
 public:
     dds_inference_sensor_proxy( std::string const & sensor_name,

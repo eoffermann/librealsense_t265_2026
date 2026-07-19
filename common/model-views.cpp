@@ -410,4 +410,95 @@ namespace rs2
         return close_clicked;
     }
 
+
+    void tm2_model::update_model_trajectory(const pose_frame& pose, bool track)
+    {
+        static bool prev_track = track;
+        if (!_trajectory_tracking)
+            return;
+
+        if (track)
+        {
+            // Reset the waypoints on stream resume
+            if (!prev_track)
+                reset_trajectory();
+
+            rs2_pose pose_data = const_cast<pose_frame&>(pose).get_pose_data();
+            auto t = pose_to_world_transformation(pose_data);
+            float model[4][4];
+            t.to_column_major((float*)model);
+
+            rs2_vector translation{ t.mat[0][3], t.mat[1][3], t.mat[2][3] };
+            tracked_point p{ translation , pose_data.tracker_confidence }; //TODO: Osnat - use tracker_confidence or mapper_confidence ?
+            // register the new waypoint
+            add_to_trajectory(p);
+        }
+
+        prev_track = track;
+    }
+
+    void tm2_model::draw_trajectory(bool is_trajectory_button_pressed)
+    {
+        if (!is_trajectory_button_pressed)
+        {
+            record_trajectory(false);
+            reset_trajectory();
+            return;
+        }
+
+        glLineWidth(3.0f);
+        glBegin(GL_LINE_STRIP);
+        for (auto&& v : trajectory)
+        {
+            switch (v.second) //color the line according to confidence
+            {
+            case 3:
+                glColor3f(0.0f, 1.0f, 0.0f); //green
+                break;
+            case 2:
+                glColor3f(1.0f, 1.0f, 0.0f); //yellow
+                break;
+            case 1:
+                glColor3f(1.0f, 0.0f, 0.0f); //red
+                break;
+            case 0:
+                glColor3f(0.7f, 0.7f, 0.7f); //grey - failed pose
+                break;
+            default:
+                throw std::runtime_error("Invalid pose confidence value");
+            }
+            glVertex3f(v.first.x, v.first.y, v.first.z);
+        }
+        glEnd();
+    }
+
+    void tm2_model::add_to_trajectory(tracked_point& p)
+    {
+        //insert first element anyway
+        if (trajectory.size() == 0)
+        {
+            trajectory.push_back(p);
+        }
+        else
+        {
+            //check if new element is far enough - more than 1 mm
+            rs2_vector prev = trajectory.back().first;
+            rs2_vector curr = p.first;
+            if (sqrt(pow((curr.x - prev.x), 2) + pow((curr.y - prev.y), 2) + pow((curr.z - prev.z), 2)) < 0.001)
+            {
+                //if too close - check confidence and replace element
+                if (p.second > trajectory.back().second)
+                {
+                    trajectory.back() = p;
+                }
+                //else - discard this sample
+            }
+            else
+            {
+                //sample is far enough - keep it
+                trajectory.push_back(p);
+            }
+        }
+    }
+
 }
