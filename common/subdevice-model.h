@@ -6,6 +6,7 @@
 #include "rendering.h"
 #include "ux-window.h"
 #include "rs-config.h"
+#include "model-views.h"  // tm2_model, for the T265 trajectory member below
 
 #define GLFW_INCLUDE_GLU
 #include <GLFW/glfw3.h>
@@ -86,6 +87,9 @@ namespace rs2
         subdevice_model(device& dev, std::shared_ptr<sensor> s, std::shared_ptr< atomic_objects_in_frame > objects, std::string& error_message, viewer_model& viewer, 
             device_model* dev_model, bool new_device_connected = true);
         ~subdevice_model();
+
+        // Per-sensor trajectory tracker for T265 pose, drawn in the 3D view.
+        tm2_model tm2;
 
         bool is_there_common_fps();
         bool supports_on_chip_calib();

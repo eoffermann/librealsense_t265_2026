@@ -1731,6 +1731,14 @@ namespace rs2
                         lab_points = f.as<labeled_points>();
                 }
 
+                if( f.is< pose_frame >() )  // aggregate trajectory even while paused so the
+                                            // drawn path stays continuous
+                {
+                    auto dev = streams[f.get_profile().unique_id()].dev;
+                    if( dev )
+                        dev->tm2.update_model_trajectory( f.as< pose_frame >(), ! paused );
+                }
+
                 auto texture = upload_frame( std::move( f ) );
 
                 if ( should_texture_frame_be_updated(f) )
@@ -2454,6 +2462,60 @@ namespace rs2
 
         auto r1 = matrix4::identity();
         auto r2 = matrix4::identity();
+
+        // T265 pose rendering. Sets r1/r2 from the live pose so the camera model below is
+        // drawn at the tracked position, and draws the accumulated trajectory.
+        {
+            auto x = static_cast<float>(-M_PI / 2);
+            float _rx[4][4] = {
+                { 1 , 0, 0, 0 },
+                { 0, static_cast<float>(cos(x)), static_cast<float>(-sin(x)), 0 },
+                { 0, static_cast<float>(sin(x)), static_cast<float>(cos(x)), 0 },
+                { 0, 0, 0, 1 }
+            };
+            static const double z = M_PI;
+            static float _rz[4][4] = {
+                { float(cos(z)), float(-sin(z)),0, 0 },
+                { float(sin(z)), float(cos(z)), 0, 0 },
+                { 0 , 0, 1, 0 },
+                { 0, 0, 0, 1 }
+            };
+            rs2::matrix4 rx(_rx);
+            rs2::matrix4 rz(_rz);
+
+            for (auto&& stream : streams)
+            {
+                if (stream.second.profile.stream_type() != RS2_STREAM_POSE)
+                    continue;
+
+                auto f = stream.second.texture->get_last_frame();
+                if (!f || !f.is<pose_frame>())
+                    continue;
+
+                rs2_pose pose_data = f.as<pose_frame>().get_pose_data();
+
+                auto t = pose_to_world_transformation(pose_data);
+                float model[4][4];
+                t.to_column_major((float*)model);
+                auto m = model;
+
+                r1 = m * rx;
+                r2 = rz * m * rx;
+
+                // set the pose transformation as the model matrix to draw the trajectory
+                glMatrixMode(GL_MODELVIEW);
+                glPushMatrix();
+                glLoadMatrixf(view);
+                glMultMatrixf((float*)_rx);
+
+                auto dev = streams[f.get_profile().unique_id()].dev;
+                if (dev)
+                    dev->tm2.draw_trajectory(true);
+
+                // remove the model matrix from the rest of the render
+                glPopMatrix();
+            }
+        }
 
         if (draw_plane && !paused)
         {
