@@ -123,3 +123,7 @@ macro(add_tm2)
     endif()
 endmacro()
 
+macro(add_l500)
+    message(STATUS "Building with L500 (L515) -- port in progress")
+    target_compile_definitions(${LRS_TARGET} PRIVATE BUILD_WITH_L500=1)
+endmacro()

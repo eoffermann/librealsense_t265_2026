@@ -15,6 +15,9 @@
 #ifdef WITH_TRACKING
 #include "tm2/tm-info.h"
 #endif
+#ifdef BUILD_WITH_L500
+#include "l500/l500-factory.h"
+#endif
 
 #include <librealsense2/h/rs_context.h>
 
@@ -216,6 +219,14 @@ backend_device_factory::create_devices_from_group( platform::backend_device_grou
         {
             auto tm2_devices = tm2_info::pick_tm2_devices( ctx, devices.usb_devices );
             std::copy( begin( tm2_devices ), end( tm2_devices ), std::back_inserter( list ) );
+        }
+#endif
+
+#ifdef BUILD_WITH_L500
+        if( mask & RS2_PRODUCT_LINE_L500 )
+        {
+            auto l500_devices = l500_info::pick_l500_devices( ctx, devices );
+            std::copy( begin( l500_devices ), end( l500_devices ), std::back_inserter( list ) );
         }
 #endif
 

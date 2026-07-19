@@ -23,7 +23,7 @@ driver, forward-port it onto current upstream code, and keep merging upstream as
 | Camera | Removed upstream | Status |
 |---|---|---|
 | **T265 / TM2** | 2023-01-04, after `v2.53.1` | ✅ Working — §1–§9 |
-| **L515 / L500** | 2023-07-12 | 🚧 Not yet scoped — §10 |
+| **L515 / L500** | 2023-07-12 | ✅ Enumerates and streams — §10–§11 |
 
 ---
 
@@ -634,7 +634,7 @@ Do not mark a phase complete on the strength of a clean build alone.
 
 ---
 
-## 10. Next: L515 / L500 restoration
+## 10. L515 / L500 restoration — IN PROGRESS
 
 L500 was removed from upstream on **2023-07-12** (`dcc73153e`, "remove l500 and zero-order
 from src/"): **6,806 deletions across 57 files**. `src/l500/` no longer exists and there is
@@ -676,3 +676,183 @@ So before L515 work can be validated on this machine:
 3. Configure a build **without** `FORCE_RSUSB_BACKEND` and confirm the MF backend builds
 
 This also closes the outstanding "cannot claim D400-class cameras are unregressed" gap.
+
+---
+
+## 11. L500 status — 2026-07-19 (ENUMERATES AND STREAMS)
+
+Branch `l500-restore`, off `master`. **`BUILD_WITH_L500` defaults OFF**, so none of this can
+affect a normal build. T265 remains working and unaffected.
+
+### Progress
+
+Compile errors across successive build rounds, each measured not estimated:
+
+```
+958 → 830 → 793 → 641 → 634 → 543 → 525 → 491 → 453 → 245
+    → 251 → 129 → 67 → 59 → 36 → 42 → 20 → 9 → 3 → 2 → 0
+```
+
+**✅ Clean compile.** `realsense2` builds with `BUILD_WITH_L500=ON`, exit 0, no link errors.
+The count rose twice — each time a fix exposed work that earlier errors had masked, which is
+the normal shape of this rather than a regression. As with T265, the raw count massively overstated the work — a handful of
+relocations were fanning out across hundreds of lines. The single biggest win was
+`time_service` (453 → 245).
+
+### Done
+
+- **Sources restored** (6,090 lines): `src/l500/` (19 files), `zero-order`, `thermal-loop`,
+  `max-usable-range`, plus `work-week` and `get-mfr-ww` recovered from *other* commits —
+  the L500 removal spans at least 8 commits, not 1
+- **Build wiring**: `BUILD_WITH_L500` option, `src/CMakeLists.txt` hookup
+- **Relocations fixed**: `float2/3` (via `src/float3.h`, *not* the rsutils header directly —
+  that leaves them in `rsutils::number`), `debug_interface`, `uvc_xu_option`,
+  `backend_device_group`, `depth-sensor.h`, `color-sensor.h`, `firmware-version.h`,
+  `hw-monitor.h`, `pose.h`, `notification_decoder`, `json.hpp` → `rsutils/json.h`
+- **Renames**: `update_progress_callback_ptr`, `frame_callback_ptr`, `lazy`,
+  `hwmon_response` → `hwmon_response_type`, `_options` → `_options_by_id`,
+  `ctx->get_backend()` → `get_backend()`, `librealsense::copy` → `memcpy`
+- **`time_service` modernised** — was an injectable `shared_ptr` interface, now a static class
+- **`recordable<>` overrides deleted** for `depth_sensor` and `debug_interface`
+- **`rs2_dsm_params` excised** — deleted from the public API Nov 2023 along with the
+  depth-to-RGB auto-calibration subsystem, which is not being restored
+- **`l500_info` rewritten** against `platform_device_info`, mirroring `d400_info`
+
+### Deliberately NOT restored
+
+| Directory | Why |
+|---|---|
+| `src/ipDeviceCommon/` | Zero references from L500. Orphaned live555 network-server code swept up in the same commit |
+| `src/ivcam/` | L500 references the **`ivcam2`** namespace, which is defined inside `l500-private.h` — L500 *is* ivcam2. No l500 file includes `ivcam-private.h`. A parallel analysis disagreed and argued it's required; the compiler has not asked for it once in ten build rounds. If that's wrong the error will be unambiguous and the fix is a two-minute restore |
+
+### Remaining — 245 errors, one interconnected piece of work
+
+| File | Errors | Work |
+|---|---:|---|
+| `l500-color.cpp` | 100 | `synthetic_sensor` construction, `get_backend()` context |
+| `l500-device.cpp` | 41 | `device` ctor → `device_info`; hw_monitor wiring |
+| `l500-private.h` | 33 | residual type/decl fallout |
+| `l500-factory.cpp` | 31 | blocked behind the device ctors below |
+| `l500-motion.cpp` | 20 | `synthetic_sensor` ctor; motion-transform args |
+| others | 20 | fw-update device ctor, options |
+
+These are **one change, not six**: `rs500_device` / `l515_device` still take
+`(ctx, group, register_device_notifications)` and must take a `device_info`. The rewritten
+`l500_info` is already correct and is simply blocked behind them — which is why the factory
+rewrite did not move the error count.
+
+Also still needed:
+
+1. **`l500_hwmon_response`** (~110 lines, ~66 of it copy-paste). The `hwmon_response` enum was
+   replaced by a per-product-line `hwmon_response_interface`; template is
+   `ds::d400_hwmon_response`
+2. **Restore `composite_processing_block`** from `6dba2b2c6^` (~70 lines) — removed for having
+   no consumers; L500's depth pipeline chains through it
+3. **`update_device` ctor** change, plus `get_name`/`get_product_line`/`get_serial_number` are
+   no longer virtual — cleanest fix is making `parse_serial_number` virtual in the base
+4. `polling_error_handler` gained a `device_alive` arg; `firmware_logger_device` ctor changed;
+   motion transforms gained required args; `l500_confidence_resolution` needs rewriting to the
+   new `void(uint32_t&,uint32_t&)` shape
+
+### ⚠️ Runtime risks — none of these produce a compiler diagnostic
+
+Recorded now because a clean compile will feel like success and these are where it isn't:
+
+1. **`composite_processing_block` inside `formats_converter`** — highest risk. Even restored,
+   it predates today's converter. L500 emits composite frames from one source profile;
+   the converter's frame routing may not tolerate it. Symptom: no frames, or a syncer
+   deadlock, silently
+2. **One-to-many profile fan-out** — `formats_converter` special-cases multi-target index
+   matching for INFRARED and COLOR only. L500 fans one source set out to DEPTH *and*
+   CONFIDENCE. Symptom: missing or duplicated confidence profiles
+3. **`get_firmware_version_string` is now a template with `reversed=true`** — wrong choice
+   yields a *plausible but wrong* version string, which then silently mis-gates every
+   `_fw_version >= …` check. Options and IMU correction would quietly not register
+4. **`hwmon_response_type` sign/width** — a mismatched underlying type makes error comparisons
+   silently wrong, corrupting every option's default and range
+5. `get_profiles_tags()` predates `format_conversion` modes; `get_gvd` gained retry codes;
+   matcher wiring bypasses today's `matcher_factory`
+
+**Hardware-free test harness worth building first:** restoring the `src/media/ros/` L500 hunks
+(~130 lines) allows validating risks 1–3 against a recorded `.bag` via a playback device,
+with no L515 attached.
+
+### Blockers
+
+1. **ATL + reboot** — the Media Foundation backend does not build without ATL, and a UVC
+   camera needs MF on Windows. `FORCE_RSUSB_BACKEND` was fine for T265 (raw USB) but is wrong
+   here. See §4a
+2. **No L515 attached yet**
+
+### Estimate
+
+~3–5 focused days to a clean compile and successful enumeration — *not* the months the raw
+line count might suggest. The reason is that `d400_device` is a working, line-by-line template
+for every structural change here, which T265 never had. The risk is not compile volume; it is
+the runtime list above.
+
+---
+
+## 12. L500 hardware verification — 2026-07-19
+
+**The L515 enumerates and streams.** All on the attached camera (serial `f0232365`, firmware
+`1.5.0`), built with the Media Foundation backend and `BUILD_WITH_L500=ON`.
+
+```
+Name                         : Intel RealSense L515
+Serial Number                : f0232365
+Firmware Version             : 1.5.0
+Recommended Firmware Version : 1.5.8.1
+Product Line                 : L500      Product Id : 0B64
+```
+
+### Streaming results
+
+| Mode | Result |
+|---|---|
+| depth | 120 frames |
+| depth + infrared | 120 + 120 |
+| **depth + confidence** | **120 + 120** — the `composite_processing_block` path |
+| color | 120 |
+| accel + gyro | 120 + 120 |
+| depth + IR + color together | 120 each |
+
+**Depth data is real, not merely present:** ~20% pixel coverage with raw values in
+`[1960 .. 32808]` at `0.00025 m` units — that is **0.49 m to 8.2 m**, exactly L515's
+operating range. The zero centre pixel is simply no return at that point.
+
+### Runtime risks — resolved by evidence
+
+| Risk | Outcome |
+|---|---|
+| 1. `composite_processing_block` in `formats_converter` | ✅ **Did not materialise.** Depth+confidence stream together |
+| 2. One-to-many profile fan-out (DEPTH *and* CONFIDENCE from one source set) | ✅ **Works.** Both enumerate and stream |
+| 3. `get_profiles_tags()` vs `format_conversion` | ✅ Full profile set enumerates correctly |
+| 4. `get_firmware_version_string` template/`reversed` | ✅ **Verified.** Reports `1.5.0`; byte order checked against the pre-removal implementation |
+| 5. `hwmon_response_type` width | ✅ Hardware-monitor reads succeed (version, serials, ASIC serial) |
+
+### Bug caught by verification, not by the compiler
+
+`l500_confidence_resolution` was reimplemented from its name rather than from the original.
+The original is `resolution{ res.height, res.width * 2 }` — the axes swap **and** the doubling
+lands on the new *height*. The first version doubled the width instead.
+
+It compiled, enumerated, and produced confidence profiles of `2048x384` that looked entirely
+plausible in isolation. Correct is `1024x768`, matching depth — one confidence value per depth
+pixel. Confirmed arithmetically: depth comes from a Z16 source at `768x1024` rotating to
+`1024x768`; confidence comes from a **RAW8 source at `384x1024`** mapping to
+`{1024, 384*2}` = `1024x768`. The buggy `2048x384` is exactly what swap-then-double-width
+yields from that same source — which is how the wrong version was confirmed to have been live
+rather than dormant.
+
+**Nothing would have flagged this until frames arrived malformed.** It was caught only by
+going back to check a value that had been guessed rather than derived — the same reason the
+firmware-version byte order was checked.
+
+### Still outstanding
+
+- **Viewer not yet tested** with L515
+- Record/playback round-trip (same gap as T265)
+- No soak testing; all runs are 120 frames
+- `src/ivcam/` still deliberately not restored — the compiler never asked for it across ~20
+  build rounds, which settles the earlier disagreement in favour of leaving it out
