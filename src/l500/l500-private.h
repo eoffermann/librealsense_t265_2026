@@ -7,8 +7,11 @@
 
 #include <src/hw-monitor.h>
 #include <src/float3.h>
+#include <src/core/stream-profile.h>
 #include <src/core/time-service.h>
 #include <src/frame.h>
+#include <limits>
+#include <type_traits>
 
 #include "../backend.h"
 #include "../types.h"
@@ -473,6 +476,167 @@ namespace librealsense
         private:
             l500_device *_l500_depth_dev;
             std::string _description;
+        };
+
+
+
+        // The free hwmon_response enum in src/hw-monitor.h was replaced by a per-product-line
+        // hwmon_response_interface. This re-homes L500's values behind that interface,
+        // keeping the original hwm_* spellings so call sites are unchanged.
+        // Template: ds::d400_hwmon_response in src/ds/d400/d400-private.h.
+        class l500_hwmon_response : public hwmon_response_interface
+        {
+        public:
+            enum opcodes : hwmon_response_type
+            {
+                hwm_Success                         =  0,
+                hwm_WrongCommand                    = -1,
+                hwm_StartNGEndAddr                  = -2,
+                hwm_AddressSpaceNotAligned          = -3,
+                hwm_AddressSpaceTooSmall            = -4,
+                hwm_ReadOnly                        = -5,
+                hwm_WrongParameter                  = -6,
+                hwm_HWNotReady                      = -7,
+                hwm_I2CAccessFailed                 = -8,
+                hwm_NoExpectedUserAction            = -9,
+                hwm_IntegrityError                  = -10,
+                hwm_NullOrZeroSizeString            = -11,
+                hwm_GPIOPinNumberInvalid            = -12,
+                hwm_GPIOPinDirectionInvalid         = -13,
+                hwm_IllegalAddress                  = -14,
+                hwm_IllegalSize                     = -15,
+                hwm_ParamsTableNotValid             = -16,
+                hwm_ParamsTableIdNotValid           = -17,
+                hwm_ParamsTableWrongExistingSize    = -18,
+                hwm_WrongCRC                        = -19,
+                hwm_NotAuthorisedFlashWrite         = -20,
+                hwm_NoDataToReturn                  = -21,
+                hwm_SpiReadFailed                   = -22,
+                hwm_SpiWriteFailed                  = -23,
+                hwm_SpiEraseSectorFailed            = -24,
+                hwm_TableIsEmpty                    = -25,
+                hwm_I2cSeqDelay                     = -26,
+                hwm_CommandIsLocked                 = -27,
+                hwm_CalibrationWrongTableId         = -28,
+                hwm_ValueOutOfRange                 = -29,
+                hwm_InvalidDepthFormat              = -30,
+                hwm_DepthFlowError                  = -31,
+                hwm_Timeout                         = -32,
+                hwm_NotSafeCheckFailed              = -33,
+                hwm_FlashRegionIsLocked             = -34,
+                hwm_SummingEventTimeout             = -35,
+                hwm_SDSCorrupted                    = -36,
+                hwm_SDSVerifyFailed                 = -37,
+                hwm_IllegalHwState                  = -38,
+                hwm_RealtekNotLoaded                = -39,
+                hwm_WakeUpDeviceNotSupported        = -40,
+                hwm_ResourceBusy                    = -41,
+                hwm_MaxErrorValue                   = -42,
+                hwm_PwmNotSupported                 = -43,
+                hwm_PwmStereoModuleNotConnected     = -44,
+                hwm_UvcStreamInvalidStreamRequest   = -45,
+                hwm_UvcControlManualExposureInvalid = -46,
+                hwm_UvcControlManualGainInvalid     = -47,
+                hwm_EyesafetyPayloadFailure         = -48,
+                hwm_ProjectorTestFailed             = -49,
+                hwm_ThreadModifyFailed              = -50,
+                hwm_HotLaserPwrReduce               = -51, // reported to error depth XU control
+                hwm_HotLaserDisable                 = -52, // reported to error depth XU control
+                hwm_FlagBLaserDisable               = -53, // reported to error depth XU control
+                hwm_NoStateChange                   = -54,
+                hwm_EEPROMIsLocked                  = -55,
+                hwm_OEMIdWrong                      = -56,
+                hwm_RealtekNotUpdated               = -57,
+                hwm_FunctionNotSupported            = -58,
+                hwm_IspNotImplemented               = -59,
+                hwm_IspNotSupported                 = -60,
+                hwm_IspNotPermited                  = -61,
+                hwm_IspNotExists                    = -62,
+                hwm_IspFail                         = -63,
+                hwm_Unknown                         = -64,
+                hwm_LastError                       = hwm_Unknown - 1,
+            };
+
+            hwmon_response_type success_value() const override { return hwm_Success; }
+
+            std::string hwmon_error2str( int e ) const override
+            {
+                auto it = _report.find( static_cast< opcodes >( e ) );
+                if( it != _report.end() )
+                    return it->second;
+                return rsutils::string::from() << "HW Monitor error (" << e << ")";
+            }
+
+        private:
+            static const std::map< opcodes, std::string > _report;
+        };
+
+
+        // Was a free function in src/image.h taking/returning a `resolution`; the transform is
+        // now a void(uint32_t&,uint32_t&) hook on stream_profile. Confidence is the rotated
+        // depth resolution at double width.
+        inline void l500_confidence_resolution( uint32_t & w, uint32_t & h )
+        {
+            std::swap( w, h );
+            w *= 2;
+        }
+
+        // Was firmware_check_interface::extract_firmware_version_string, removed with L500;
+        // the D400 line kept an identical copy in the ds namespace.
+        inline std::string extract_firmware_version_string( const std::vector< uint8_t > & fw_image )
+        {
+            auto version_offset = offsetof( platform::dfu_header, bcdDevice );
+            if( fw_image.size() < ( version_offset + sizeof( size_t ) ) )
+                throw std::runtime_error( "Firmware binary image might be corrupted - size is only: "
+                                          + std::to_string( fw_image.size() ) );
+
+            auto version = fw_image.data() + version_offset;
+            uint8_t major = *( version + 3 );
+            uint8_t minor = *( version + 2 );
+            uint8_t patch = *( version + 1 );
+            uint8_t build = *( version );
+
+            return std::to_string( major ) + "." + std::to_string( minor ) + "."
+                 + std::to_string( patch ) + "." + std::to_string( build );
+        }
+
+        // Was #define L51X_RECOMMENDED_FIRMWARE_VERSION in common/fw/firmware-version.h,
+        // deleted along with the firmware-bundling machinery.
+        #define L51X_RECOMMENDED_FIRMWARE_VERSION "1.5.8.1"
+
+        // Was a file-scope constant in src/types.h, removed along with L500.
+        static const double TIMESTAMP_USEC_TO_MSEC = 0.001;
+
+        // Was librealsense::arithmetic_wraparound in src/types.h, removed alongside L500
+        // because nothing else used it. Kept local rather than restored to a shared header.
+        // Provides an efficient wraparound for built-in arithmetic types, for use-cases such
+        // as a rolling timestamp.
+        template <typename T, typename S>
+        class arithmetic_wraparound
+        {
+        public:
+            arithmetic_wraparound() :
+                last_input(std::numeric_limits<T>::lowest()), accumulated(0) {
+                static_assert(
+                    (std::is_arithmetic<T>::value) &&
+                    (std::is_arithmetic<S>::value) &&
+                    (std::numeric_limits<T>::max() < std::numeric_limits<S>::max()) &&
+                    (std::numeric_limits<T>::lowest() >= std::numeric_limits<S>::lowest())
+                    , "Wraparound class requirements are not met");
+            }
+
+            S calc(const T input)
+            {
+                accumulated += static_cast<T>(input - last_input); // Automatically resolves wraparounds
+                last_input = input;
+                return (accumulated);
+            }
+
+            void reset() { last_input = std::numeric_limits<T>::lowest();  accumulated = 0; }
+
+        private:
+            T last_input;
+            S accumulated;
         };
 
         class l500_timestamp_reader : public frame_timestamp_reader

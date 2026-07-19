@@ -28,8 +28,7 @@ namespace librealsense
         std::shared_ptr<synthetic_sensor> create_color_device(std::shared_ptr<context> ctx,
             const std::vector<platform::uvc_device_info>& color_devices_info);
 
-        l500_color(std::shared_ptr<context> ctx,
-            const platform::backend_device_group& group);
+        l500_color( std::shared_ptr< const l500_info > const & dev_info );
 
         l500_color_sensor * get_color_sensor() override;
 

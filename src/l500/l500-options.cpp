@@ -3,6 +3,7 @@
 
 #include "l500-options.h"
 #include "l500-private.h"
+#include "l500-factory.h"
 #include "l500-depth.h"
 #include <src/firmware-version.h>
 
@@ -143,14 +144,14 @@ namespace librealsense
             &response );
 
         // Some controls that are automatically set by the FW (e.g., APD when digital gain is AUTO) are read-only
-        // and have no defaults: the FW will return hwm_IllegalHwState for these. Some can still be modified (e.g.,
-        // laser power & min distance), and for these we expect hwm_Success.
-        if( response == hwm_IllegalHwState )
+        // and have no defaults: the FW will return l500_hwmon_response::hwm_IllegalHwState for these. Some can still be modified (e.g.,
+        // laser power & min distance), and for these we expect l500_hwmon_response::hwm_Success.
+        if( response == l500_hwmon_response::hwm_IllegalHwState )
         {
             success = false;
             return -1;
         }
-        else if( response != hwm_Success )
+        else if( response != l500_hwmon_response::hwm_Success )
         {
             std::stringstream s;
             s << "hw_monitor  AMCGET of " << _type << " return error " << response;
@@ -212,11 +213,15 @@ namespace librealsense
         return float( val );
     }
 
-    l500_options::l500_options(std::shared_ptr<context> ctx, const platform::backend_device_group & group) :
-        device(ctx, group),
-        l500_device(ctx, group)
+    l500_options::l500_options( std::shared_ptr< const l500_info > const & dev_info ) :
+        backend_device(dev_info),
+        l500_device(dev_info)
     {
-        auto& raw_depth_sensor = get_raw_depth_sensor();
+        // ctx and group used to arrive as constructor arguments; they now hang off
+        // the device_info.
+        auto ctx = dev_info->get_context();
+        auto const & group = dev_info->get_group();
+        auto raw_depth_sensor = get_raw_depth_sensor();
         auto& depth_sensor = get_depth_sensor();
 
         // Keep the USB power on while triggering multiple HW monitor commands on it.

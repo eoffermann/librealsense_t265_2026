@@ -10,6 +10,8 @@
 #include "l500-depth.h"
 #include "l500-color.h"
 #include "l500-private.h"
+#include "l500-factory.h"
+#include <src/platform/platform-utils.h>
 
 #include <src/proc/decimation-filter.h>
 #include <src/proc/threshold.h>
@@ -29,6 +31,10 @@
 #include <vector>
 
 
+#include <iomanip>
+#include <sstream>
+#include <src/metadata.h>
+#include <src/metadata-parser.h>
 #include <rsutils/type/fourcc.h>
 using rs_fourcc = rsutils::type::fourcc;
 
@@ -52,14 +58,18 @@ namespace librealsense
 
     using namespace ivcam2;
 
-    l500_device::l500_device(std::shared_ptr<context> ctx,
-        const platform::backend_device_group& group)
-        :device(ctx, group), global_time_interface(), 
+    l500_device::l500_device( std::shared_ptr< const l500_info > const & dev_info )
+        :device(dev_info),
+        backend_device(dev_info), global_time_interface(), 
         _depth_stream(new stream(RS2_STREAM_DEPTH)),
         _ir_stream(new stream(RS2_STREAM_INFRARED)),
         _confidence_stream(new stream(RS2_STREAM_CONFIDENCE)),
         _temperatures()
     {
+        // ctx and group used to arrive as constructor arguments; they now hang off
+        // the device_info.
+        auto ctx = dev_info->get_context();
+        auto const & group = dev_info->get_group();
         _depth_device_idx = add_sensor(create_depth_device(ctx, group.uvc_devices));
         _pid = group.uvc_devices.front().pid;
         std::string device_name = (rs500_sku_names.end() != rs500_sku_names.find(_pid)) ? rs500_sku_names.at(_pid) : "RS5xx";
@@ -69,7 +79,7 @@ namespace librealsense
         auto&& backend = get_backend();
 
         auto& depth_sensor = get_depth_sensor();
-        auto& raw_depth_sensor = get_raw_depth_sensor();
+        auto raw_depth_sensor = get_raw_depth_sensor();
 
 #ifndef HWM_OVER_XU
         if( group.usb_devices.size() > 0 )
@@ -77,16 +87,16 @@ namespace librealsense
             // This use-case is mainly to support FW development & debugging on unlock units before they
             // have any XU capabilities
             _hw_monitor = std::make_shared<hw_monitor>(
-                std::make_shared<locked_transfer>( backend.create_usb_device( group.usb_devices.front() ),
-                    raw_depth_sensor ) );
+                std::make_shared<locked_transfer>( backend->create_usb_device( group.usb_devices.front() ),
+                    raw_depth_sensor ), std::make_shared<ivcam2::l500_hwmon_response>() );
         }
         else
 #endif
         {
             _hw_monitor = std::make_shared<hw_monitor>(
                 std::make_shared<locked_transfer>( std::make_shared<command_transfer_over_xu>(
-                    raw_depth_sensor, depth_xu, L500_HWMONITOR ),
-                    raw_depth_sensor ) );
+                    *raw_depth_sensor, depth_xu, L500_HWMONITOR ),
+                    raw_depth_sensor ), std::make_shared<ivcam2::l500_hwmon_response>() );
         }
 
         std::vector<uint8_t> gvd_buff(HW_MONITOR_BUFFER_SIZE);
@@ -96,16 +106,23 @@ namespace librealsense
 
         auto optic_serial = _hw_monitor->get_module_serial_string(gvd_buff, module_serial_offset, module_serial_size);
         auto asic_serial = _hw_monitor->get_module_serial_string(gvd_buff, module_asic_serial_offset, module_asic_serial_size);
-        auto fwv = _hw_monitor->get_firmware_version_string(gvd_buff, fw_version_offset);
+        auto fwv = _hw_monitor->get_firmware_version_string< uint8_t >(gvd_buff, fw_version_offset);
         _fw_version = firmware_version(fwv);
 
         _is_locked = _hw_monitor->get_gvd_field<uint8_t>(gvd_buff, is_camera_locked_offset) != 0;
 
-        auto pid_hex_str = hexify(group.uvc_devices.front().pid);
+        std::string pid_hex_str;
+        {
+            // librealsense::hexify() was removed from types.h; reproduce its formatting.
+            std::ostringstream oss;
+            oss << std::setw( sizeof( uint16_t ) * 2 ) << std::setfill( '0' ) << std::uppercase
+                << std::hex << group.uvc_devices.front().pid;
+            pid_hex_str = oss.str();
+        }
 
         using namespace platform;
 
-        _usb_mode = raw_depth_sensor.get_usb_specification();
+        _usb_mode = raw_depth_sensor->get_usb_specification();
         if (usb_spec_names.count(_usb_mode) && (usb_undefined != _usb_mode))
         {
             auto usb_type_str = usb_spec_names.at(_usb_mode);
@@ -158,7 +175,7 @@ namespace librealsense
 
         std::vector<std::shared_ptr<platform::uvc_device>> depth_devices;
         for( auto&& info : filter_by_mi( all_device_infos, 0 ) ) // Filter just mi=0, DEPTH
-            depth_devices.push_back( backend.create_uvc_device( info ) );
+            depth_devices.push_back( backend->create_uvc_device( info ) );
 
         std::unique_ptr<frame_timestamp_reader> timestamp_reader_metadata( new l500_timestamp_reader_from_metadata() );
         auto enable_global_time_option = std::shared_ptr<global_time_option>( new global_time_option() );
@@ -220,7 +237,7 @@ namespace librealsense
 
         depth_sensor.register_processing_block(
             { {RS2_FORMAT_Z16}, {RS2_FORMAT_Y8} },
-            { {RS2_FORMAT_Z16, RS2_STREAM_DEPTH, 0, 0, 0, 0, &rotate_resolution} },
+            { {RS2_FORMAT_Z16, RS2_STREAM_DEPTH, 0, 0, 0, 0, &stream_profile::rotate_resolution} },
             [=]() {
                 auto z16rot = std::make_shared<rotation_transform>(RS2_FORMAT_Z16, RS2_STREAM_DEPTH, RS2_EXTENSION_DEPTH_FRAME);
                 auto y8rot = std::make_shared<rotation_transform>(RS2_FORMAT_Y8, RS2_STREAM_INFRARED, RS2_EXTENSION_VIDEO_FRAME);
@@ -239,8 +256,8 @@ namespace librealsense
         depth_sensor.register_processing_block(
             { {RS2_FORMAT_Z16}, {RS2_FORMAT_Y8}, {RS2_FORMAT_RAW8} },
             {
-                {RS2_FORMAT_Z16, RS2_STREAM_DEPTH, 0, 0, 0, 0, &rotate_resolution},
-                {RS2_FORMAT_RAW8, RS2_STREAM_CONFIDENCE, 0, 0, 0, 0, &l500_confidence_resolution}
+                {RS2_FORMAT_Z16, RS2_STREAM_DEPTH, 0, 0, 0, 0, &stream_profile::rotate_resolution},
+                {RS2_FORMAT_RAW8, RS2_STREAM_CONFIDENCE, 0, 0, 0, 0, &ivcam2::l500_confidence_resolution}
             },
             [=]() {
                 auto z16rot = std::make_shared<rotation_transform>(RS2_FORMAT_Z16, RS2_STREAM_DEPTH, RS2_EXTENSION_DEPTH_FRAME);
@@ -261,13 +278,13 @@ namespace librealsense
 
         depth_sensor.register_processing_block(
             { {RS2_FORMAT_Y8} },
-            { {RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 0, 0, 0, 0, &rotate_resolution} },
+            { {RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 0, 0, 0, 0, &stream_profile::rotate_resolution} },
             []() { return std::make_shared<rotation_transform>(RS2_FORMAT_Y8, RS2_STREAM_INFRARED, RS2_EXTENSION_VIDEO_FRAME); }
         );
 
         depth_sensor.register_processing_block(
             { {RS2_FORMAT_RAW8} },
-            { {RS2_FORMAT_RAW8, RS2_STREAM_CONFIDENCE, 0, 0, 0, 0, &l500_confidence_resolution} },
+            { {RS2_FORMAT_RAW8, RS2_STREAM_CONFIDENCE, 0, 0, 0, 0, &ivcam2::l500_confidence_resolution} },
             []() { return std::make_shared<confidence_rotation_transform>(); }
         );
 
@@ -304,6 +321,11 @@ namespace librealsense
         command cmd(ivcam2::fw_cmd::HW_RESET);
         cmd.require_response = false;
         _hw_monitor->send(cmd);
+    }
+
+    std::string l500_device::get_opcode_string(int opcode) const
+    {
+        return ivcam2::l500_hwmon_response().hwmon_error2str(opcode);
     }
 
     double l500_device::get_device_time_ms()
@@ -378,7 +400,7 @@ namespace librealsense
         std::vector<uint8_t> flash;
         flash.reserve(flash_size);
 
-        get_raw_depth_sensor().invoke_powered([&](platform::uvc_device& dev)
+        get_raw_depth_sensor()->invoke_powered([&](platform::uvc_device& dev)
         {
             for (int i = 0; i < max_iterations; i++)
             {
@@ -498,7 +520,7 @@ namespace librealsense
         if (_is_locked)
             throw std::runtime_error("this camera is locked and doesn't allow direct flash write, for firmware update use rs2_update_firmware method (DFU)");
 
-        get_raw_depth_sensor().invoke_powered([&](platform::uvc_device& dev)
+        get_raw_depth_sensor()->invoke_powered([&](platform::uvc_device& dev)
         {
             command cmdPFD(ivcam2::PFD);
             cmdPFD.require_response = false;
@@ -701,7 +723,7 @@ namespace librealsense
 
     bool l500_device::check_fw_compatibility(const std::vector<uint8_t>& image) const
     {
-        std::string fw_version = extract_firmware_version_string(image);
+        std::string fw_version = ivcam2::extract_firmware_version_string(image);
 
         auto min_max_fw_it = ivcam2::device_to_fw_min_max_version.find(_pid);
         if (min_max_fw_it == ivcam2::device_to_fw_min_max_version.end())

@@ -6,6 +6,7 @@
 #include <src/firmware-version.h>
 
 // Types below moved out of the headers that used to provide them transitively.
+#include <src/backend-device.h>
 #include <src/core/debug.h>
 #include <src/core/notification.h>
 #include <src/platform/backend-device-group.h>
@@ -26,18 +27,18 @@
 
 namespace librealsense
 {
+    class l500_info;
     class l500_depth_sensor;
     class l500_color_sensor;
 
     class l500_device
-        : public virtual device
+        : public virtual backend_device
         , public debug_interface
         , public global_time_interface
         , public updatable
     {
     public:
-        l500_device(std::shared_ptr<context> ctx,
-            const platform::backend_device_group& group);
+        l500_device( std::shared_ptr< const l500_info > const & dev_info );
 
         std::shared_ptr<synthetic_sensor> create_depth_device(std::shared_ptr<context> ctx,
             const std::vector<platform::uvc_device_info>& all_device_infos);
@@ -48,13 +49,14 @@ namespace librealsense
 
         synthetic_sensor & get_synthetic_depth_sensor() { return dynamic_cast< synthetic_sensor &>(get_sensor( _depth_device_idx )); }
         l500_depth_sensor & get_depth_sensor();
-        uvc_sensor& get_raw_depth_sensor()
+        std::shared_ptr< uvc_sensor > get_raw_depth_sensor()
         {
             synthetic_sensor& depth_sensor = get_synthetic_depth_sensor();
-            return dynamic_cast<uvc_sensor&>(*depth_sensor.get_raw_sensor());
+            return std::dynamic_pointer_cast< uvc_sensor >( depth_sensor.get_raw_sensor() );
         }
 
         std::vector< uint8_t > send_receive_raw_data(const std::vector< uint8_t > & input) override;
+        std::string get_opcode_string(int opcode) const override;
         std::vector<uint8_t> build_command(uint32_t opcode,
             uint32_t param1 = 0,
             uint32_t param2 = 0,
@@ -87,6 +89,10 @@ namespace librealsense
 
 
     protected:
+        // Mirrors d400_device: the polling error handler holds a weak_ptr to this so its
+        // worker thread can tell whether the device is still alive.
+        std::shared_ptr< std::atomic< bool > > _device_alive = std::make_shared< std::atomic< bool > >( true );
+
         void start_temperatures_reader();
         void stop_temperatures_reader();
 

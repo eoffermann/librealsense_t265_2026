@@ -4,6 +4,8 @@
 #include "l500-color.h"
 
 #include "l500-private.h"
+#include "l500-factory.h"
+#include <src/platform/platform-utils.h>
 #include "proc/color-formats-converter.h"
 #include "algo/thermal-loop/l500-thermal-loop.h"
 
@@ -13,6 +15,8 @@
 #include <mutex>
 
 
+#include <src/metadata.h>
+#include <src/metadata-parser.h>
 #include <rsutils/type/fourcc.h>
 using rs_fourcc = rsutils::type::fourcc;
 
@@ -56,7 +60,7 @@ namespace librealsense
 
         std::unique_ptr<frame_timestamp_reader> timestamp_reader_metadata(new ivcam2::l500_timestamp_reader_from_metadata());
         auto enable_global_time_option = std::shared_ptr<global_time_option>(new global_time_option());
-        auto raw_color_ep = std::make_shared<uvc_sensor>("RGB Camera", get_backend().create_uvc_device(color_devices_info.front()),
+        auto raw_color_ep = std::make_shared<uvc_sensor>("RGB Camera", get_backend()->create_uvc_device(color_devices_info.front()),
             std::unique_ptr<frame_timestamp_reader>(new global_timestamp_reader(std::move(timestamp_reader_metadata), _tf_keeper, enable_global_time_option)),
             this);
         auto color_ep = std::make_shared<l500_color_sensor>(this, raw_color_ep, ctx, l500_color_fourcc_to_rs2_format, l500_color_fourcc_to_rs2_stream);
@@ -83,8 +87,8 @@ namespace librealsense
 
         color_ep->register_option(RS2_OPTION_GLOBAL_TIME_ENABLED, enable_global_time_option);
 
-        auto white_balance_option = std::make_shared<uvc_pu_option>(*raw_color_ep, RS2_OPTION_WHITE_BALANCE);
-        auto auto_white_balance_option = std::make_shared<uvc_pu_option>(*raw_color_ep, RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE);
+        auto white_balance_option = std::make_shared<uvc_pu_option>(raw_color_ep, RS2_OPTION_WHITE_BALANCE);
+        auto auto_white_balance_option = std::make_shared<uvc_pu_option>(raw_color_ep, RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE);
         color_ep->register_option(RS2_OPTION_WHITE_BALANCE, white_balance_option);
         color_ep->register_option(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE, auto_white_balance_option);
         color_ep->register_option(RS2_OPTION_WHITE_BALANCE,
@@ -92,8 +96,8 @@ namespace librealsense
                 white_balance_option,
                 auto_white_balance_option));
 
-        auto exposure_option = std::make_shared<uvc_pu_option>(*raw_color_ep, RS2_OPTION_EXPOSURE);
-        auto auto_exposure_option = std::make_shared<uvc_pu_option>(*raw_color_ep, RS2_OPTION_ENABLE_AUTO_EXPOSURE);
+        auto exposure_option = std::make_shared<uvc_pu_option>(raw_color_ep, RS2_OPTION_EXPOSURE);
+        auto auto_exposure_option = std::make_shared<uvc_pu_option>(raw_color_ep, RS2_OPTION_ENABLE_AUTO_EXPOSURE);
         color_ep->register_option(RS2_OPTION_EXPOSURE, exposure_option);
         color_ep->register_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, auto_exposure_option);
         color_ep->register_option(RS2_OPTION_EXPOSURE,
@@ -102,7 +106,7 @@ namespace librealsense
                 auto_exposure_option));
 
         color_ep->register_option(RS2_OPTION_POWER_LINE_FREQUENCY,
-            std::make_shared<uvc_pu_option>(*raw_color_ep, RS2_OPTION_POWER_LINE_FREQUENCY,
+            std::make_shared<uvc_pu_option>(raw_color_ep, RS2_OPTION_POWER_LINE_FREQUENCY,
                 std::map<float, std::string>{ { 0.f, "Disabled"},
                 { 1.f, "50Hz" },
                 { 2.f, "60Hz" },
@@ -173,11 +177,16 @@ namespace librealsense
         return color_ep;
     }
 
-    l500_color::l500_color(std::shared_ptr<context> ctx, const platform::backend_device_group & group)
-        :device(ctx, group),
-        l500_device(ctx, group),
+    l500_color::l500_color( std::shared_ptr< const l500_info > const & dev_info )
+        :device(dev_info),
+        backend_device(dev_info),
+        l500_device(dev_info),
          _color_stream(new stream(RS2_STREAM_COLOR))
     {
+        // ctx and group used to arrive as constructor arguments; they now hang off
+        // the device_info.
+        auto ctx = dev_info->get_context();
+        auto const & group = dev_info->get_group();
         auto color_devs_info = filter_by_mi(group.uvc_devices, 4);
         if (color_devs_info.size() != 1)
             throw invalid_value_exception( rsutils::string::from()
@@ -205,7 +214,7 @@ namespace librealsense
             auto data = read_fw_table_raw( *_hw_monitor,
                                            algo::thermal_loop::l500::thermal_calibration_table::id,
                                            response );
-            if( response != hwm_Success )
+            if( response != l500_hwmon_response::hwm_Success )
             {
                 LOG_WARNING( "Failed to read FW table 0x"
                              << std::hex

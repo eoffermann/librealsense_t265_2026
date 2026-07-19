@@ -8,6 +8,8 @@
 #include "l500-depth.h"
 #include "l500-color.h"
 #include "l500-private.h"
+#include "l500-factory.h"
+#include <src/sync.h>
 #include "proc/decimation-filter.h"
 #include "proc/threshold.h" 
 #include "proc/spatial-filter.h"
@@ -66,15 +68,19 @@ namespace librealsense
         return resolutions_depth_table_output;
     }
 
-    l500_depth::l500_depth(std::shared_ptr<context> ctx,
-                             const platform::backend_device_group& group)
-        :device(ctx, group),
-        l500_device(ctx, group)
+    l500_depth::l500_depth( std::shared_ptr< const l500_info > const & dev_info )
+        :device(dev_info),
+        backend_device(dev_info),
+        l500_device(dev_info)
     {
+        // ctx and group used to arrive as constructor arguments; they now hang off
+        // the device_info.
+        auto ctx = dev_info->get_context();
+        auto const & group = dev_info->get_group();
         _calib_table = [this]() { return read_intrinsics_table(); };
 
         auto& depth_sensor = get_depth_sensor();
-        auto& raw_depth_sensor = get_raw_depth_sensor();
+        auto raw_depth_sensor = get_raw_depth_sensor();
 
         depth_sensor.register_option(
             RS2_OPTION_LLD_TEMPERATURE,
@@ -121,7 +127,8 @@ namespace librealsense
 
         _polling_error_handler = std::make_shared<polling_error_handler>(1000,
             error_control,
-            raw_depth_sensor.get_notifications_processor(),
+            std::weak_ptr<std::atomic<bool>>( _device_alive ),
+            raw_depth_sensor->get_notifications_processor(),
             std::make_shared<l500_notification_decoder>());
 
         depth_sensor.register_option(RS2_OPTION_ERROR_POLLING_ENABLED, std::make_shared<polling_errors_disable>(_polling_error_handler));

@@ -9,8 +9,9 @@
 
 namespace librealsense
 {
-    l500_update_device::l500_update_device(std::shared_ptr<context> ctx, bool register_device_notifications, std::shared_ptr<platform::usb_device> usb_device)
-        : update_device(ctx, register_device_notifications, usb_device), _product_line("L500")
+    l500_update_device::l500_update_device( std::shared_ptr< const device_info > const & dev_info,
+                                            std::shared_ptr< platform::usb_device > const & usb_device )
+        : update_device( dev_info, usb_device, "L500" )
     {
         auto info = usb_device->get_info();
         _name = ivcam2::rs500_sku_names.find(info.pid) != ivcam2::rs500_sku_names.end() ? ivcam2::rs500_sku_names.at(info.pid) : "unknown";
@@ -24,7 +25,7 @@ namespace librealsense
 
     bool l500_update_device::check_fw_compatibility(const std::vector<uint8_t>& image) const
     {
-        std::string fw_version = extract_firmware_version_string(image);
+        std::string fw_version = ivcam2::extract_firmware_version_string(image);
         auto min_max_fw_it = ivcam2::device_to_fw_min_max_version.find(_usb_device->get_info().pid);
         if (min_max_fw_it == ivcam2::device_to_fw_min_max_version.end())
             throw librealsense::invalid_value_exception(

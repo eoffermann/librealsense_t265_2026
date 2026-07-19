@@ -35,8 +35,7 @@ namespace librealsense
 
         ivcam2::intrinsic_depth read_intrinsics_table() const;
 
-        l500_depth(std::shared_ptr<context> ctx,
-            const platform::backend_device_group& group);
+        l500_depth( std::shared_ptr< const l500_info > const & dev_info );
 
         ~l500_depth() { stop_temperatures_reader(); }
 

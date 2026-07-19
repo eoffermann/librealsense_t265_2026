@@ -178,8 +178,7 @@ namespace librealsense
     class l500_options : public virtual l500_device
     {
     public:
-        l500_options(std::shared_ptr<context> ctx,
-            const platform::backend_device_group& group);
+        l500_options( std::shared_ptr< const l500_info > const & dev_info );
 
         std::vector<rs2_option> get_advanced_controls();
         void change_preset( rs2_l500_visual_preset preset );

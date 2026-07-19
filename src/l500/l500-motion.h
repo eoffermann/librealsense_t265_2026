@@ -20,8 +20,7 @@ namespace librealsense
         std::shared_ptr<synthetic_sensor> create_hid_device(std::shared_ptr<context> ctx,
             const std::vector<platform::hid_device_info>& all_hid_infos);
 
-        l500_motion(std::shared_ptr<context> ctx,
-            const platform::backend_device_group& group);
+        l500_motion( std::shared_ptr< const l500_info > const & dev_info );
 
         std::vector<tagged_profile> get_profiles_tags() const override;
 

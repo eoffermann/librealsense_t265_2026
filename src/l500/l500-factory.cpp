@@ -14,6 +14,8 @@
 #include "../firmware_logger_device.h"
 
 #include "l500-factory.h"
+#include <src/platform/platform-utils.h>
+#include <src/sync.h>
 #include "l500-depth.h"
 #include "l500-motion.h"
 #include "l500-color.h"
@@ -32,17 +34,17 @@ namespace librealsense
         public firmware_logger_device
     {
     public:
-        l515_device(std::shared_ptr<context> ctx,
-            const platform::backend_device_group& group,
-            bool register_device_notifications)
-            : device(ctx, group, register_device_notifications),
-            l500_device(ctx, group),
-            l500_depth(ctx, group),
-            l500_options(ctx, group),
-            l500_color(ctx, group),
-            l500_motion(ctx, group),
+        l515_device( std::shared_ptr< const l500_info > const & dev_info,
+                     bool register_device_notifications )
+            : device(dev_info, register_device_notifications),
+            backend_device(dev_info, register_device_notifications),
+            l500_device(dev_info),
+            l500_depth(dev_info),
+            l500_options(dev_info),
+            l500_color(dev_info),
+            l500_motion(dev_info),
             l500_serializable(l500_device::_hw_monitor, get_depth_sensor()),
-            firmware_logger_device(ctx, group, l500_device::_hw_monitor,
+            firmware_logger_device(dev_info, l500_device::_hw_monitor,
                 get_firmware_logs_command(),
                 get_flash_logs_command())
         {}
@@ -63,17 +65,20 @@ namespace librealsense
         };
     };
 
-    class rs500_device : public l500_depth,
+    // Renamed from rs500_device: upstream's D500 line later introduced its own
+    // librealsense::rs500_device (src/ds/d500/d500-factory.cpp) for the D5xx family, and both
+    // in the same namespace is a link error. This one is the original L500.
+    class l500_rs500_device : public l500_depth,
         public firmware_logger_device
     {
     public:
-        rs500_device(std::shared_ptr<context> ctx,
-            const platform::backend_device_group& group,
-            bool register_device_notifications)
-            : device(ctx, group, register_device_notifications),
-            l500_device(ctx, group),
-            l500_depth(ctx, group),
-            firmware_logger_device(ctx, group,l500_device::_hw_monitor,
+        l500_rs500_device( std::shared_ptr< const l500_info > const & dev_info,
+                      bool register_device_notifications )
+            : device(dev_info, register_device_notifications),
+            backend_device(dev_info, register_device_notifications),
+            l500_device(dev_info),
+            l500_depth(dev_info),
+            firmware_logger_device(dev_info, l500_device::_hw_monitor,
                 get_firmware_logs_command(),
                 get_flash_logs_command())
         {}
@@ -95,7 +100,7 @@ namespace librealsense
         switch (pid)
         {
         case L500_PID:
-            return std::make_shared<rs500_device>(dev_info, register_device_notifications);
+            return std::make_shared<l500_rs500_device>(dev_info, register_device_notifications);
         case L515_PID_PRE_PRQ:
         case L515_PID:
             return std::make_shared<l515_device>(dev_info, register_device_notifications);
@@ -151,7 +156,7 @@ namespace librealsense
         return results;
     }
 
-    std::shared_ptr<matcher> rs500_device::create_matcher(const frame_holder& frame) const
+    std::shared_ptr<matcher> l500_rs500_device::create_matcher(const frame_holder& frame) const
     {
         return l500_depth::create_matcher(frame);
     }

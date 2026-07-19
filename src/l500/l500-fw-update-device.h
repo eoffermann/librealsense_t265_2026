@@ -21,21 +21,17 @@ namespace librealsense
             uint8_t serial[6];
         };
 
-        l500_update_device(std::shared_ptr<context> ctx, bool register_device_notifications, std::shared_ptr<platform::usb_device> usb_device);
+        l500_update_device( std::shared_ptr< const device_info > const & dev_info,
+                            std::shared_ptr< platform::usb_device > const & usb_device );
         virtual ~l500_update_device() = default;
 
         void update(const void* fw_image, int fw_image_size, rs2_update_progress_callback_sptr = nullptr) const override;
         virtual bool check_fw_compatibility(const std::vector<uint8_t>& image) const override;
 
     protected:
-        virtual const std::string& get_name() const override { return _name; }
-        virtual const std::string& get_product_line() const override { return _product_line; }
-        virtual const std::string& get_serial_number() const override { return _serial_number; }
-        std::string parse_serial_number(const std::vector<uint8_t>& buffer) const;
-
-    private:
-        std::string _name;
-        std::string _product_line;
-        std::string _serial_number;
+        // get_name/get_product_line/get_serial_number are non-virtual on the base now and
+        // read its own members, so the overrides (and the shadowing members) are gone.
+        // parse_serial_number stays: L515's EEPROM byte order differs.
+        std::string parse_serial_number(const std::vector<uint8_t>& buffer) const override;
     };
 }
