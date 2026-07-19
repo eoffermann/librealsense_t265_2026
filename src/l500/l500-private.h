@@ -577,8 +577,12 @@ namespace librealsense
         // depth resolution at double width.
         inline void l500_confidence_resolution( uint32_t & w, uint32_t & h )
         {
-            std::swap( w, h );
-            w *= 2;
+            // Matches the original exactly: resolution{ res.height, res.width * 2 }.
+            // i.e. the axes swap AND the doubling lands on the new height, not the new
+            // width. Getting this backwards produces plausible-looking but wrong profiles.
+            uint32_t const src_w = w, src_h = h;
+            w = src_h;
+            h = src_w * 2;
         }
 
         // Was firmware_check_interface::extract_firmware_version_string, removed with L500;
