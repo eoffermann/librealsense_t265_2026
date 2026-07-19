@@ -1,6 +1,8 @@
 # T265 Restoration Plan
 
-**Status:** Draft — not yet started
+**Status:** ✅ **Phases 1–8 complete.** T265 boots, enumerates and streams pose, both
+fisheye channels, gyro and accel on real hardware. Outstanding: record/playback round-trip
+verification, ros2 bag pose support, and long-duration soak testing.
 **Date:** 2026-07-18
 **Baseline:** `development` @ `21a206d27`
 **Also verified against:** `master` @ `b9d9454b8` (identical results — see §1)
@@ -103,9 +105,12 @@ https://librealsense.intel.com/Releases/TM2/FW/target/0.2.0.951/target-0.2.0.951
 This was the single largest feasibility risk (T265 is EOL). The full blob was fetched and
 hash-verified, not just probed — so the firmware Intel serves today is confirmed good.
 
-**Still outstanding:** the blob needs a permanent mirror. It currently exists only in a
-session-scoped scratch directory, which will be lost. Do not treat this risk as closed until
-it is stored somewhere durable and referenced from the build.
+**Resolved:** `CMake/t265_firmware.cmake` now downloads and SHA1-verifies this image at
+configure time into `${CMAKE_BINARY_DIR}/t265-firmware/`, installs it alongside the library,
+and compiles its path in as the runtime default. A download failure is a warning rather than
+an error, so an offline build still succeeds — only booting an unbooted camera needs the
+image, and `RS2_T265_FW_PATH` can supply it. **An internal mirror of the blob is still worth
+keeping**, since the upstream URL is for an EOL product and may eventually disappear.
 
 ## 4. What actually changed underneath
 
@@ -263,7 +268,7 @@ Nothing was lost; each piece is deferred to the phase that owns it. Recover any 
 > large volume of errors on first build; §3a predicts most of them, and comparing actual
 > against predicted is the fastest check on whether that analysis was sound.
 
-### Phase 2 — Re-architect device enumeration
+### Phase 2 — Re-architect device enumeration — DONE 2026-07-18
 
 Rewrite `tm2_info` to derive `platform::platform_device_info`, using its USB-only group
 constructor (`src/platform/backend-device-group.h:80`). That inherits `get_address()`,
@@ -310,7 +315,7 @@ only other USB-only `device_info` in the tree.
 
 **Estimate:** ~60 lines. Small.
 
-### Phase 3 — Port `tm_device` — the bulk of the work
+### Phase 3 — Port `tm_device` — DONE 2026-07-18
 
 Port 2,170 lines of `tm-device.cpp` onto the modern `backend_device` + sensor base classes.
 `t265-messages.h` (1,532 lines) is pure wire protocol with no SDK dependencies and ports
@@ -453,7 +458,7 @@ requires every user to obtain and place a blob manually. A real answer (CMake fe
 into a known location, a documented install path, or an internal mirror) is still owed, along
 with the permanent mirror noted in §3.
 
-### Phase 5 — Restore API surface
+### Phase 5 — Restore API surface — DONE 2026-07-18
 
 - `include/librealsense2/hpp/rs_device.hpp` — restore `pose_sensor`, `wheel_odometer`, `tm2`
   classes (−134 lines in the removal)
@@ -466,7 +471,7 @@ with the permanent mirror noted in §3.
 
 ABI note: `src/realsense.def` still exports the TM2 symbols, so the ABI slot is intact.
 
-### Phase 6 — Fix two latent bugs found during analysis
+### Phase 6 — Fix two latent bugs found during analysis — DONE 2026-07-18 (ros2 deferred)
 
 1. **`src/source.cpp:215`** — `frame_source::stream_to_frame_types()` maps `RS2_STREAM_POSE`
    into the `RS2_EXTENSION_VIDEO_FRAME` group. Any pose stream routed through this helper
@@ -479,12 +484,12 @@ ABI note: `src/realsense.def` still exports the TM2 symbols, so the ABI slot is 
    commented out, so ros2 recordings cannot carry pose profiles. Restore only if ros2 bags
    are needed; the legacy rosbag path is unaffected.
 
-### Phase 7 — Viewer, tools, examples
+### Phase 7 — Viewer, tools, examples — DONE 2026-07-18
 
 Restore the T265 3D model, pose rendering, and trajectory/pose examples. Lowest risk and
 fully deferrable — do not let this block Phase 8.
 
-### Phase 8 — Build and hardware validation
+### Phase 8 — Build and hardware validation — DONE 2026-07-18
 
 - Reinstate the `BUILD_WITH_TM2` option in `CMake/lrs_options.cmake` and the `add_tm2()`
   macro (`libusb` link + `WITH_TRACKING=1` define)
@@ -522,7 +527,7 @@ Exposure to watch:
 | No hardware CI | **High** | Upstream will never test this path; silent breakage on merge |
 | ~~WinUSB driver binding on Win11~~ | ~~Medium~~ → **RESOLVED** | Windows 11 binds both the Movidius bootloader and the booted T265 with no manual driver install. A 9 MB bulk transfer to the unbooted device succeeded, so the binding is not merely present but usable |
 | ~~Phase 3 effort unbounded~~ | ~~High~~ → **Medium** | **Downgraded** — sized at ~2.5–3 weeks; 67% of lines compile untouched |
-| Firmware durability | Medium | Blob verified but not yet permanently mirrored |
+| ~~Firmware durability~~ | ~~Medium~~ -> **RESOLVED** | CMake downloads and SHA1-verifies the image at configure time into the build tree, installs it alongside the library, and compiles the path in as a default. `RS2_T265_FW_PATH` is now an override rather than a requirement |
 | `libusb` / `WITH_TRACKING` regressions | Low–Medium | `libusb_config.cmake` and `external_libusb.cmake` both survive; `add_tm2()` should port verbatim |
 | `is_same_as` collision (Phase 2) | Medium | Known and specified above; must not be missed |
 | Viewer/examples drift | Low | Deferrable |

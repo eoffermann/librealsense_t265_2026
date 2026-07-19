@@ -17,6 +17,7 @@ struct short3
 #include <res/d435.h>
 #include <res/d415.h>
 #include <res/d455.h>
+#include <res/t265.h>
 
 static const char* vertex_shader_text =
 "#version 110\n"
@@ -126,6 +127,7 @@ namespace librealsense
             camera_mesh.push_back(load_model(uncompress_d415_obj));
             camera_mesh.push_back(load_model(uncompress_d435_obj));
             camera_mesh.push_back(load_model(uncompress_d455_obj));
+            camera_mesh.push_back(load_model(uncompress_t265_obj));
 
             register_option(RS2_OPTION_FILTER_MAGNITUDE, std::make_shared<librealsense::float_option>(option_range{ 0, 1, 0, 1 }));
             _opacity_opt = &get_option(RS2_OPTION_FILTER_MAGNITUDE);
@@ -167,6 +169,7 @@ namespace librealsense
                 if (dev_name.find("D435") != std::string::npos ||
                     dev_name.find("D436") != std::string::npos) index = 1;
                 if (dev_name.find("D45") != std::string::npos) index = 2;
+                if (dev_name.find("T265") != std::string::npos) index = 3;
             };
 
             auto opacity = clamp(_opacity_opt->query(), 0.0, 1.0);

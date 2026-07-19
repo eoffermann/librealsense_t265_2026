@@ -208,11 +208,18 @@ namespace librealsense
         case RS2_STREAM_OBJECT_DETECTION:
             return RS2_EXTENSION_OBJECT_DETECTION_FRAME;
 
+        case RS2_STREAM_POSE:
+            // Was previously grouped with the video streams below, which meant a pose stream
+            // routed through this helper allocated a video frame and then failed its
+            // RS2_EXTENSION_POSE_FRAME check. The legacy rosbag reader hid the problem by
+            // hardcoding the extension itself; a pose-capable sensor going through
+            // uvc-sensor.cpp does not.
+            return RS2_EXTENSION_POSE_FRAME;
+
         case RS2_STREAM_COLOR:
         case RS2_STREAM_INFRARED:
         case RS2_STREAM_FISHEYE:
         case RS2_STREAM_GPIO:
-        case RS2_STREAM_POSE:
         case RS2_STREAM_CONFIDENCE:
         case RS2_STREAM_SAFETY:
         case RS2_STREAM_OCCUPANCY:

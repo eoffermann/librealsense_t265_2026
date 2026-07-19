@@ -29,11 +29,18 @@ namespace {
 
     std::vector< uint8_t > load_target_firmware()
     {
-        auto path = getenv( FW_PATH_ENV_VAR );
+        // RS2_T265_FW_PATH wins if set; otherwise fall back to the image CMake downloaded
+        // and hash-verified at configure time.
+        char const * path = getenv( FW_PATH_ENV_VAR );
+#ifdef T265_DEFAULT_FW_PATH
+        if( ! path )
+            path = T265_DEFAULT_FW_PATH;
+#endif
         if( ! path )
         {
-            LOG_ERROR( "Cannot boot T265: " << FW_PATH_ENV_VAR
-                       << " is not set -- point it at the target-*.mvcmd firmware image" );
+            LOG_ERROR( "Cannot boot T265: no firmware image available. Set " << FW_PATH_ENV_VAR
+                       << " to a target-*.mvcmd image, or rebuild with network access so the "
+                          "image can be downloaded." );
             return {};
         }
 

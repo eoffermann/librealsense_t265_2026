@@ -107,12 +107,19 @@ macro(global_target_config)
 endmacro()
 
 macro(add_tm2)
-    message(STATUS "Building with TM2 (T265) -- port in progress")
+    message(STATUS "Building with TM2 (T265)")
     include(libusb_config)
     target_link_libraries(${LRS_TARGET} PRIVATE usb)
     if(USE_EXTERNAL_USB)
         add_dependencies(${LRS_TARGET} libusb)
     endif()
     target_compile_definitions(${LRS_TARGET} PRIVATE WITH_TRACKING=1)
+
+    # Fetch and verify the firmware image, and compile in its location as the default.
+    # RS2_T265_FW_PATH overrides this at runtime.
+    include(${CMAKE_SOURCE_DIR}/CMake/t265_firmware.cmake)
+    if(EXISTS "${T265_FW_FILE}")
+        target_compile_definitions(${LRS_TARGET} PRIVATE T265_DEFAULT_FW_PATH="${T265_FW_FILE}")
+    endif()
 endmacro()
 

@@ -35,6 +35,11 @@ namespace rs2
 {
     void prepare_config_file();
 
+    // Defined in model-views.cpp. Declared here so the T265 localization-map import/export
+    // in device-model.cpp can reach them.
+    std::vector<uint8_t> bytes_from_bin_file(const std::string& filename);
+    void bin_file_from_bytes(const std::string& filename, const std::vector<uint8_t> bytes);
+
     bool frame_metadata_to_csv( const std::string & filename, rs2::frame frame );
 
     bool motion_data_to_csv( const std::string & filename, rs2::frame frame );
