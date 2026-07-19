@@ -128,28 +128,68 @@ The USB abstraction layer (`src/usb/`) is unchanged in the ways that matter:
 
 ---
 
-## 4a. Development environment — **BLOCKER, must be resolved before Phase 1**
+## 4a. Development environment — **RESOLVED (one caveat)**
 
 Target dev/test machine is the Windows 11 laptop the T265 will be attached to. Audited
-2026-07-18: **no C++ build toolchain is installed.**
+2026-07-18 and found to have no C++ toolchain at all; installed the same day.
 
-| Requirement | State | Needed |
+| Requirement | State | Notes |
 |---|---|---|
-| CMake ≥ 3.10 | **ABSENT** (not on PATH, not in any standard install dir) | 3.16.3+ recommended |
-| Visual Studio / MSVC | **ABSENT** (no install dir, no `vswhere`, no `cl`, no `msbuild`) | VS 2019/2022, "Desktop development with C++" workload — or standalone Build Tools |
-| Ninja / gcc (alternatives) | **ABSENT** | — |
-| Python 3 | **STUB ONLY** — resolves to the Microsoft Store `WindowsApps` alias, not a real interpreter | Real CPython 3.x, needed for unit tests and `pyrealsense2` |
-| Git | Present (2.55.0) | — |
+| CMake | ✅ **4.4.0** | User-scope winget install. See CMake 4.x note below |
+| MSVC | ✅ **VS Build Tools 2022** 17.14.37502, toolset 14.44.35207 | `cl.exe` verified present |
+| Python 3 | ✅ **3.12.10** | At `%LOCALAPPDATA%\Programs\Python\Python312\`. The Store `WindowsApps` alias still shadows it on PATH — disable the alias or use the full path |
+| Git | ✅ 2.55.0 | — |
+| **ATL (`atlcomcli.h`)** | ❌ **MISSING** | Required by the Media Foundation backend (`src/mf/`). See below |
 
-Nothing can be compiled, and therefore nothing can be tested against hardware, until this is
-installed. This is the single gating prerequisite for the whole plan.
+### Baseline build achieved — 2026-07-18
 
-**Recommended sequence once installed:**
+`realsense2.dll` (8.2 MB) builds cleanly from `t265-restore` (which differs from
+`origin/development` by documentation only, so it is a valid baseline):
 
-1. Build **unmodified** `development` first, before any T265 code is added. This establishes
-   a known-good baseline. Without it, a build failure after Phase 1 is ambiguous — a
-   pre-existing environment problem is indistinguishable from a porting mistake.
-2. Only then begin Phase 1.
+```
+cmake -S . -B build-rsusb -G "Visual Studio 17 2022" -A x64 \
+      -DFORCE_RSUSB_BACKEND=ON -DBUILD_EXAMPLES=OFF \
+      -DBUILD_GRAPHICAL_EXAMPLES=OFF -DBUILD_TOOLS=OFF
+cmake --build build-rsusb --config Release --parallel --target realsense2
+  -> exit 0, zero errors
+```
+
+This is the known-good reference. Any build failure after Phase 1 is now attributable to the
+port rather than the environment.
+
+### Outstanding: ATL, blocked on a pending reboot
+
+The default (Media Foundation) backend build fails with:
+
+```
+src/mf/mf-uvc.h(11,10): fatal error C1083: Cannot open include file: 'atlcomcli.h'
+src/mf/mf-hid.h(10,10): fatal error C1083: Cannot open include file: 'atlcomcli.h'
+```
+
+`Microsoft.VisualStudio.Component.VC.ATL` was not pulled in by the VCTools workload's
+`--includeRecommended`. Attempts to add it fail with VS installer error **8006** because a
+**reboot is pending** from the Build Tools install (confirmed via `RebootPending` /
+`RebootRequired` registry keys).
+
+**Action required: reboot, then run**
+
+```powershell
+winget install --id Microsoft.VisualStudio.2022.BuildTools --force `
+  --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Component.VC.ATL"
+```
+
+This is not blocking Phase 1. `FORCE_RSUSB_BACKEND=ON` bypasses `src/mf/` entirely, and that
+is the libusb/WinUSB path T265 uses anyway — so the T265 work can proceed on the RSUSB build
+while the MF backend remains unbuildable. It **will** need fixing before any claim about
+not regressing D400-class cameras on the default Windows backend.
+
+### CMake 4.x note
+
+CMake 4.x removed compatibility with projects declaring `cmake_minimum_required` below 3.5.
+Every in-tree declaration is ≥ 3.8, and **configure succeeds** with only deprecation warnings.
+Externally fetched dependencies (pybind11, Catch2, FastDDS) are the residual risk, and they
+are pulled in only when Python bindings, unit tests, or DDS are enabled — none of which the
+baseline exercised yet. If it bites, pin CMake 3.31.x.
 
 **Windows-specific notes for T265:**
 
@@ -433,7 +473,8 @@ Exposure to watch:
 
 | Risk | Severity | Notes |
 |---|---|---|
-| **No build toolchain installed** | **BLOCKER** | §4a — nothing compiles or is testable until resolved |
+| ~~No build toolchain installed~~ | ~~BLOCKER~~ → **RESOLVED** | §4a — toolchain installed and baseline `realsense2.dll` builds clean |
+| ATL missing → MF backend unbuildable | Medium | §4a — blocked on a pending reboot. Does not block T265 (RSUSB path), but blocks any D400 non-regression claim on the default Windows backend |
 | Frame-pool retuning (Phase 3) | **High** | Archive keying changed; `set_max_publish_list_size` now per-archive. Compile-clean but drops frames. Hardware-only diagnosis |
 | Profile tagging / `format_conversion` | **High** | New machinery T265 predates; likely "enumerates but won't stream". Hardware-only diagnosis |
 | No hardware CI | **High** | Upstream will never test this path; silent breakage on merge |
