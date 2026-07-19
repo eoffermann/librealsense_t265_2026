@@ -78,6 +78,10 @@ else()
     endif()
 endif()
 
+if(BUILD_WITH_TM2)
+    add_tm2()
+endif()
+
 # configure the project according to OS specific requirments
 # macro definition located at "CMake/<OS>_config.cmake"
 os_target_config()

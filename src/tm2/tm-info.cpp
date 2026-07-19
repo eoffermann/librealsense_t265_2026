@@ -1,60 +1,58 @@
 // License: Apache 2.0. See LICENSE file in root directory.
-// Copyright(c) 2017 Intel Corporation. All Rights Reserved.
-
-#include <mutex>
-#include <chrono>
-#include <vector>
-#include <iterator>
-#include <cstddef>
-#include <thread>
+// Copyright(c) 2017-2026 RealSense, Inc. All Rights Reserved.
 
 #include "tm-info.h"
-#include "tm-device.h"
-#include "common/fw/target.h"
+
+#include <src/context.h>
+#include <src/librealsense-exception.h>
+#include <src/platform/platform-utils.h>
+
+#include <rsutils/easylogging/easyloggingpp.h>
 
 namespace librealsense
 {
-    tm2_info::tm2_info(std::shared_ptr<context> ctx, platform::usb_device_info hwm)
-        : device_info(ctx), _hwm(std::move(hwm))
+    // PID of a booted T265. Before it is sent its firmware the device enumerates as a
+    // Movidius bootloader (0x03E7:0x2150) instead -- see tm-boot.h.
+    static const uint16_t T265_BOOTED_PID = 0x0B37;
+
+
+    std::shared_ptr< device_interface > tm2_info::create_device()
     {
-        LOG_DEBUG("tm2_info created for " << this);
+        // Phase 3 replaces this with construction of the tm2_device, once tm-device.cpp has
+        // been ported onto the current device / backend_device base classes. Until then the
+        // device enumerates and can be listed, but cannot be opened -- and says so, rather
+        // than failing in some less obvious way further down.
+        throw not_implemented_exception(
+            "T265 support is still being ported: the device enumerates but cannot yet be opened" );
     }
 
-    tm2_info::~tm2_info()
+
+    bool tm2_info::is_same_as( std::shared_ptr< const device_info > const & other ) const
     {
-        LOG_DEBUG("tm2_info destroyed for " << this);
+        auto rhs = std::dynamic_pointer_cast< const tm2_info >( other );
+        if( ! rhs )
+            return false;
+
+        // Compare the USB nodes directly; see the note in the header for why the inherited
+        // implementation cannot be used.
+        return ! list_changed( get_group().usb_devices, rhs->get_group().usb_devices );
     }
 
-    std::shared_ptr<device_interface> tm2_info::create(std::shared_ptr<context> ctx,
-        bool register_device_notifications) const
-    {
-        LOG_DEBUG("tm2_info::create " << this);
-        return std::make_shared<tm2_device>(ctx, get_device_data(), register_device_notifications);
-    }
 
-    platform::backend_device_group tm2_info::get_device_data() const
+    std::vector< std::shared_ptr< tm2_info > >
+    tm2_info::pick_tm2_devices( std::shared_ptr< context > ctx,
+                                std::vector< platform::usb_device_info > & usb )
     {
-        LOG_DEBUG("tm2_info::get_device_data " << this);
-        auto bdg = platform::backend_device_group({}, { _hwm });
-        return bdg;
-    }
+        std::vector< std::shared_ptr< tm2_info > > results;
 
-    std::vector<std::shared_ptr<device_info>> tm2_info::pick_tm2_devices(
-        std::shared_ptr<context> ctx,
-        std::vector<platform::usb_device_info>& usb)
-    {
-        std::vector<std::shared_ptr<device_info>> results;
-        // We shouldn't talk to the device here, it might not
-        // even be around anymore (this gets called with an out of
-        // date list on disconnect).
-        auto correct_pid = filter_by_product(usb, { 0x0B37 });
-        if (correct_pid.size())
-        {
-            LOG_INFO("Picked " << correct_pid.size() << "/" << usb.size() << " devices");
+        // Deliberately does not talk to the hardware: this is also called with a stale list
+        // when devices disconnect, at which point the device may already be gone.
+        auto correct_pid = filter_by_product( usb, { T265_BOOTED_PID } );
+        for( auto & dev : correct_pid )
+            results.push_back( std::make_shared< tm2_info >( ctx, dev ) );
 
-            for(auto & dev : correct_pid)
-                results.push_back(std::make_shared<tm2_info>(ctx, dev));
-        }
+        if( ! results.empty() )
+            LOG_INFO( "Picked " << results.size() << "/" << usb.size() << " T265 devices" );
 
         return results;
     }
